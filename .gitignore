@@ -1,3 +1,4 @@
 /__pycache__/*
 cmai-data/*
 classify.py
+/data/*.csv
