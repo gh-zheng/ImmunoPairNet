@@ -2,3 +2,4 @@
 cmai-data/*
 classify.py
 /data/*.csv
+/model_parameter/*
