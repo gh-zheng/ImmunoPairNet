@@ -34,7 +34,7 @@ SEED = 42
 
 # behavior
 DO_SMOKE_TEST = True         # one forward pass on each dataset if file exists
-LOCAL_TEST_100 = True        # run on first 100 rows for a quick local sanity training
+LOCAL_TEST_100 = False        # run on first 100 rows for a quick local sanity training
 
 # saving
 SAVE_DIR = "model_parameter"
