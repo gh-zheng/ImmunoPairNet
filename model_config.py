@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 @dataclass
 class EmbedderConfig:
     esm_model_name: str = "facebook/esm2_t33_650M_UR50D"
-    pairformer_blocks: int = 12
+    pairformer_blocks: int = 16
     pair_c: int = 128
     allow_inter_chain: bool = False
     attn_from_last_layer_only: bool = True

@@ -1,6 +1,6 @@
-# train_bcr_classifier.py
-import os, random, json
-from typing import List, Dict, Any, OrderedDict
+# train_bcr_classifier.py  (multi-dataset training + simple flags + DP)
+import os, random, json, time
+from typing import Tuple, Any, Dict
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
@@ -11,20 +11,20 @@ from classification import load_default_config, build_embedder, build_classifier
 # ---- datasets (your file) ----
 from Panimmnue_dataload import (
     IEDBRetrainMHCDataset, collate_mhc_panimmune,
-    IntegratedTCRDataset, collate_tcr_panimmune,
+    IntegratedTCRDataset,   collate_tcr_panimmune,
     IntegratedAntibodyDataset, collate_antibody_panimmune,
 )
 
-# ============================= Config (edit here) ============================= #
-# paths
-PATH_MHC = "data\IEDB_retrain_extraction_MHC_final.csv"   # TRAIN ON THIS
-PATH_TCR = "integrated_TCR_data.csv"                 # optional smoke test
-PATH_AB  = "integrated_antibody_data.csv"            # optional smoke test
+# ============================= Defaults ============================= #
+DATA_PATHS = {
+    "mhc": "data/IEDB_retrain_extraction_MHC_final.csv",
+    "tcr": "data/integrated_TCR_data.csv",
+    "ab":  "data/integrated_antibody_data.csv",
+}
 
-# train hyperparams
-EPOCHS = 30
-BATCH_SIZE = 1
-LR = 3e-4                    # smaller LR since we train ESM too
+EPOCHS = 10
+BATCH_SIZE = 256                # per-step batch for any dataset
+LR = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 NUM_WORKERS = 4
@@ -32,15 +32,13 @@ PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 SEED = 42
 
-# behavior
-DO_SMOKE_TEST = True         # one forward pass on each dataset if file exists
-LOCAL_TEST_100 = False        # run on first 100 rows for a quick local sanity training
+DO_SMOKE_TEST = True
+LOCAL_TEST_100 = True
 
-# saving
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
 CONFIG_OUT = os.path.join(SAVE_DIR, "config.json")
-SAVE_EVERY = 5               # epochs
+SAVE_EVERY = 5
 
 # ============================= Utils ============================= #
 def set_seed(seed: int = 42):
@@ -51,6 +49,8 @@ def set_seed(seed: int = 42):
 
 @torch.no_grad()
 def smoke_test(model: nn.Module, dl: DataLoader, name: str):
+    if dl is None:
+        return
     try:
         batch_samples, labels, _ = next(iter(dl))
     except StopIteration:
@@ -63,139 +63,166 @@ def save_embedder_only(embedder: nn.Module, path: str):
     torch.save({"state_dict": embedder.state_dict()}, path)
 
 def save_classification_head_only(model: PairAwareClassifier, path: str):
-    """
-    Save only the 'classification' model (pool + classifier), excluding embedder params.
-    """
     head_state = {k: v for k, v in model.state_dict().items() if not k.startswith("embedder.")}
     torch.save({"state_dict": head_state}, path)
 
-# ============================= Train ============================= #
-def main():
+# ============================= Data helpers ============================= #
+def make_dataset_and_loader(kind: str, path: str, batch_size: int) -> Tuple[Any, DataLoader]:
+    """
+    Build a dataset + dataloader for the given kind ('mhc' | 'tcr' | 'ab').
+    Returns (dataset, dataloader). Raises FileNotFoundError if missing.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"[{kind}] Missing file: {path}")
+
+    if kind == "mhc":
+        ds = IEDBRetrainMHCDataset(path, binarize=True, threshold=0.5)
+        if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
+        dl = DataLoader(
+            ds, batch_size=batch_size, shuffle=True, collate_fn=collate_mhc_panimmune,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
+        )
+    elif kind == "tcr":
+        ds = IntegratedTCRDataset(path, binarize=True, threshold=0.5)
+        if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
+        dl = DataLoader(
+            ds, batch_size=batch_size, shuffle=True, collate_fn=collate_tcr_panimmune,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
+        )
+    elif kind == "ab":
+        ds = IntegratedAntibodyDataset(path, require_light=False, binarize=True, threshold=0.5)
+        if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
+        dl = DataLoader(
+            ds, batch_size=batch_size, shuffle=True, collate_fn=collate_antibody_panimmune,
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
+        )
+    else:
+        raise ValueError(f"Unknown dataset kind: {kind}")
+    return ds, dl
+
+# ============================= Train loop (per-dataloader) ============================= #
+def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, grad_clip_norm: float) -> Tuple[float, float]:
+    total, correct, total_loss = 0, 0, 0.0
+    for batch_samples, labels, _ in dl:
+        labels = labels.to(device, non_blocking=True)
+
+        logits = model(batch_samples)     # [B, 2]
+        loss = loss_fn(logits, labels)
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip_norm is not None:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+        opt.step()
+
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            total += labels.numel()
+            correct += (preds == labels).sum().item()
+            total_loss += float(loss.item()) * labels.size(0)
+    epoch_loss = total_loss / max(total, 1)
+    epoch_acc = correct / max(total, 1)
+    return epoch_loss, epoch_acc
+
+# ============================= Main (controlled by simple flags below) ============================= #
+def run_training(train_sets: list, epochs: int = EPOCHS, batch_size: int = BATCH_SIZE,
+                 lr: float = LR, weight_decay: float = WEIGHT_DECAY, save_every: int = SAVE_EVERY,
+                 save_dir: str = SAVE_DIR, config_out: str = CONFIG_OUT):
+    # Seed & device
     set_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print(f"[Device] Using {device} | CUDA devices: {torch.cuda.device_count()} | TrainSets={train_sets}")
 
-    # ---- build config, embedder, classifier
+    # Build config / model
     cfg = load_default_config()
-    # Train embedder + ESM jointly
-    cfg.embedder.freeze_esm = False        # IMPORTANT: unfreeze ESM
-    # (Optional precision tweaks)
-    # cfg.embedder.torch_dtype = None
-
+    cfg.embedder.freeze_esm = True  # keep ESM frozen
     embedder = build_embedder(cfg.embedder, device=device)
-    model = build_classifier(embedder, cfg.classifier, device=device)  # PairAwareClassifier
+    model = build_classifier(embedder, cfg.classifier, device=device)
 
-    # Ensure ESM is train mode (since we unfreeze)
-    try:
-        model.embedder.esm.train().requires_grad_(True)
-    except Exception:
-        pass
+    # Multi-GPU (DataParallel)
+    if torch.cuda.device_count() > 1:
+        print(f"[Parallel] Using {torch.cuda.device_count()} GPUs via DataParallel")
+        model = nn.DataParallel(model)
 
-    # ---- optimizer / loss
-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    loss_fn = nn.CrossEntropyLoss()  # labels must be ints in {0,1}
+    # Optimizer / loss
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.CrossEntropyLoss()
 
-    # ---- dataloaders
-    if not os.path.exists(PATH_MHC):
-        raise FileNotFoundError(f"Missing file: {PATH_MHC}")
+    # Build loaders for selected datasets
+    loaders: Dict[str, DataLoader] = {}
+    for kind in train_sets:
+        try:
+            _, dl = make_dataset_and_loader(kind, DATA_PATHS[kind], batch_size)
+            loaders[kind] = dl
+        except FileNotFoundError as e:
+            print(e)
 
-    mhc_ds_full = IEDBRetrainMHCDataset(PATH_MHC, binarize=True, threshold=0.5)
-    if LOCAL_TEST_100:
-        indices = list(range(min(1, len(mhc_ds_full))))
-        mhc_ds = Subset(mhc_ds_full, indices)
-        print(f"[LocalTest] Using first {len(indices)} samples for quick training.")
-    else:
-        mhc_ds = mhc_ds_full
+    if not loaders:
+        raise RuntimeError("No datasets available to train on. Please check file paths.")
 
-
-    mhc_dl = DataLoader(
-        mhc_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_mhc_panimmune,
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
-    )
-
-    # optional smoke tests on other datasets
-    if DO_SMOKE_TEST and os.path.exists(PATH_TCR):
-        tcr_ds = IntegratedTCRDataset(PATH_TCR, binarize=True, threshold=0.5)
-        tcr_dl = DataLoader(
-            tcr_ds, batch_size=min(BATCH_SIZE, 2), shuffle=False, collate_fn=collate_tcr_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
-        )
-    else:
-        tcr_dl = None
-        if DO_SMOKE_TEST: print(f"[TCR] {PATH_TCR} not found — skipping smoke test.")
-
-    if DO_SMOKE_TEST and os.path.exists(PATH_AB):
-        ab_ds = IntegratedAntibodyDataset(PATH_AB, require_light=False, binarize=True, threshold=0.5)
-        ab_dl = DataLoader(
-            ab_ds, batch_size=min(BATCH_SIZE, 2), shuffle=False, collate_fn=collate_antibody_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
-        )
-    else:
-        ab_dl = None
-        if DO_SMOKE_TEST: print(f"[AB]  {PATH_AB} not found — skipping smoke test.")
-
-    # ---- smoke tests
+    # Optional smoke tests
     model.eval()
     with torch.no_grad():
-        smoke_test(model, mhc_dl, "MHC(train)")
-        if tcr_dl: smoke_test(model, tcr_dl, "TCR(test)")
-        if ab_dl:  smoke_test(model, ab_dl,  "AB(test)")
+        for kind, dl in loaders.items():
+            smoke_test(model, dl, f"{kind.upper()}(train)")
 
-    # ---- training (embedder + classifier jointly)
+    # Train
     model.train()
-    for epoch in range(1, EPOCHS + 1):
-        print(epoch)
-        total, correct, total_loss = 0, 0, 0.0
+    for epoch in range(1, epochs + 1):
+        print(f"\n=== Epoch {epoch} ===")
+        per_ds_metrics = {}
+        start = time.time()
 
-        for batch_samples, labels, _ in mhc_dl:
-            labels = labels.to(device, non_blocking=True)
+        for kind, dl in loaders.items():
+            ds_loss, ds_acc = train_one_loader(model, dl, loss_fn, opt, device, GRAD_CLIP_NORM)
+            per_ds_metrics[kind] = (ds_loss, ds_acc)
+            print(f"[{kind}] loss={ds_loss:.4f}  acc={ds_acc:.3f}")
 
-            logits = model(batch_samples)     # [B, 2]
-            loss = loss_fn(logits, labels)
+        # macro-average across datasets
+        avg_loss = sum(l for l, _ in per_ds_metrics.values()) / len(per_ds_metrics)
+        avg_acc  = sum(a for _, a in per_ds_metrics.values()) / len(per_ds_metrics)
+        dt = time.time() - start
+        print(f"[avg]  loss={avg_loss:.4f}  acc={avg_acc:.3f}  time={dt:.1f}s")
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if GRAD_CLIP_NORM is not None:
-                nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
-            opt.step()
-
-            with torch.no_grad():
-                preds = logits.argmax(dim=1)
-                total += labels.numel()
-                correct += (preds == labels).sum().item()
-                total_loss += float(loss.item()) * labels.size(0)
-
-        epoch_loss = total_loss / max(total, 1)
-        epoch_acc = correct / max(total, 1)
-        print(f"epoch {epoch}: loss={epoch_loss:.4f}  acc={epoch_acc:.3f}")
-
-        # ---- periodic saving every SAVE_EVERY epochs
-        if epoch % SAVE_EVERY == 0:
-            emb_path = os.path.join(SAVE_DIR, f"embedder_epoch{epoch}.pt")
-            cls_path = os.path.join(SAVE_DIR, f"classification_epoch{epoch}.pt")
-            save_embedder_only(model.embedder, emb_path)
-            save_classification_head_only(model, cls_path)
+        # periodic save (unwrap DP if needed)
+        if epoch % save_every == 0:
+            msave = model.module if isinstance(model, nn.DataParallel) else model
+            emb_path = os.path.join(save_dir, f"embedder_epoch{epoch}.pt")
+            cls_path = os.path.join(save_dir, f"classification_epoch{epoch}.pt")
+            save_embedder_only(msave.embedder, emb_path)
+            save_classification_head_only(msave, cls_path)
             print(f"Saved: {emb_path}  |  {cls_path}")
 
-    # ---- final save
-    emb_path = os.path.join(SAVE_DIR, f"embedder_final.pt")
-    cls_path = os.path.join(SAVE_DIR, f"classification_final.pt")
-    save_embedder_only(model.embedder, emb_path)
-    save_classification_head_only(model, cls_path)
+    # final save
+    msave = model.module if isinstance(model, nn.DataParallel) else model
+    emb_path = os.path.join(save_dir, f"embedder_final.pt")
+    cls_path = os.path.join(save_dir, f"classification_final.pt")
+    save_embedder_only(msave.embedder, emb_path)
+    save_classification_head_only(msave, cls_path)
     print(f"Saved final: {emb_path}  |  {cls_path}")
 
-    # ---- save config for reproducibility
-    with open(CONFIG_OUT, "w") as f:
+    # write config
+    with open(config_out, "w") as f:
         json.dump({
             "embedder": cfg.embedder.__dict__,
             "classifier": cfg.classifier.__dict__,
             "train": {
-                "epochs": EPOCHS, "batch_size": BATCH_SIZE, "lr": LR,
-                "weight_decay": WEIGHT_DECAY, "seed": SEED,
-                "grad_clip_norm": GRAD_CLIP_NORM,
-                "local_test_100": LOCAL_TEST_100
+                "epochs": epochs, "batch_size": batch_size,
+                "lr": lr, "weight_decay": weight_decay, "seed": SEED,
+                "grad_clip_norm": GRAD_CLIP_NORM, "local_test_100": LOCAL_TEST_100,
+                "train_sets": train_sets
             }
         }, f, indent=2)
-    print(f"Saved config to {CONFIG_OUT}")
+    print(f"Saved config to {config_out}")
 
+# ============================= Simple switches here ============================= #
 if __name__ == "__main__":
-    main()
+    # ---- Edit these two lines to control training sets ----
+    MHC_ONLY   = True              # if True, forces training on MHC only
+    TRAIN_SETS = ["mhc", "tcr", "ab"]    # used only when MHC_ONLY is False; choose any of: "mhc", "tcr", "ab"
+
+    selected_sets = ["mhc"] if MHC_ONLY else TRAIN_SETS
+    run_training(train_sets=selected_sets)
