@@ -84,6 +84,7 @@ class PanimmuneEmbedderPairs(nn.Module):
         # Simple sequence cache (CPU)
         self.enable_cache = enable_cache
         self._cache = _LRUSeqCache(max_size=cache_size) if enable_cache else None
+        self.register_buffer("_device_anchor", torch.empty(0))
 
         # Fast attention & TF32 friendly settings (safe no-ops on CPU)
         try:
@@ -219,7 +220,7 @@ class PanimmuneEmbedderPairs(nn.Module):
                 pair_mask:   [B, Lmax, Lmax] (True = valid pair)
             meta: { "offsets_per_sample": List[List[(st,en)]], "lengths": List[int], "Lmax": int }
         """
-        device = next(self.parameters()).device
+        device = self._device_anchor.device
         B = len(batch_pairs)
         if B == 0:
             c_s = self.esm.config.hidden_size

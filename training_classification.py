@@ -22,7 +22,7 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-EPOCHS = 10
+EPOCHS = 1
 BATCH_SIZE = 256                # per-step batch for any dataset
 LR = 3e-4
 WEIGHT_DECAY = 0.01
@@ -138,7 +138,7 @@ def run_training(train_sets: list, epochs: int = EPOCHS, batch_size: int = BATCH
 
     # Build config / model
     cfg = load_default_config()
-    cfg.embedder.freeze_esm = True  # keep ESM frozen
+    cfg.embedder.freeze_esm = False  
     embedder = build_embedder(cfg.embedder, device=device)
     model = build_classifier(embedder, cfg.classifier, device=device)
 
