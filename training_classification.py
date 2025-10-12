@@ -22,8 +22,8 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-EPOCHS = 1
-BATCH_SIZE = 256                # per-step batch for any dataset
+EPOCHS = 10
+BATCH_SIZE = 32                # per-step batch for any dataset
 LR = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
@@ -32,8 +32,8 @@ PIN_MEMORY = True
 PERSISTENT_WORKERS = True
 SEED = 42
 
-DO_SMOKE_TEST = True
-LOCAL_TEST_100 = True
+DO_SMOKE_TEST = False
+LOCAL_TEST_100 = False
 
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -76,25 +76,25 @@ def make_dataset_and_loader(kind: str, path: str, batch_size: int) -> Tuple[Any,
         raise FileNotFoundError(f"[{kind}] Missing file: {path}")
 
     if kind == "mhc":
-        ds = IEDBRetrainMHCDataset(path, binarize=True, threshold=0.5)
+        ds = IEDBRetrainMHCDataset(path, binarize=False, threshold=0.5)
         if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
         dl = DataLoader(
             ds, batch_size=batch_size, shuffle=True, collate_fn=collate_mhc_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS, drop_last=True
         )
     elif kind == "tcr":
-        ds = IntegratedTCRDataset(path, binarize=True, threshold=0.5)
+        ds = IntegratedTCRDataset(path, binarize=False, threshold=0.5)
         if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
         dl = DataLoader(
             ds, batch_size=batch_size, shuffle=True, collate_fn=collate_tcr_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS, drop_last=True
         )
     elif kind == "ab":
-        ds = IntegratedAntibodyDataset(path, require_light=False, binarize=True, threshold=0.5)
+        ds = IntegratedAntibodyDataset(path, require_light=False, binarize=False, threshold=0.5)
         if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
         dl = DataLoader(
             ds, batch_size=batch_size, shuffle=True, collate_fn=collate_antibody_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS
+            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS, drop_last=True
         )
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
