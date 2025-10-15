@@ -22,8 +22,8 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-EPOCHS = 10
-BATCH_SIZE = 32                # per-step batch for any dataset
+EPOCHS = 30
+BATCH_SIZE = 8                # per-step batch for any dataset
 LR = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
@@ -38,9 +38,16 @@ LOCAL_TEST_100 = False
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
 CONFIG_OUT = os.path.join(SAVE_DIR, "config.json")
-SAVE_EVERY = 5
+SAVE_EVERY = 1
 
 # ============================= Utils ============================= #
+def pick_device():
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -130,10 +137,14 @@ def run_training(train_sets: list, epochs: int = EPOCHS, batch_size: int = BATCH
                  save_dir: str = SAVE_DIR, config_out: str = CONFIG_OUT):
     # Seed & device
     set_seed(SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    device = pick_device()
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    elif device.type == "xpu":
+        # No cuDNN on Intel GPUs; optional XPU sync calls in your loops if needed:
+        pass
     print(f"[Device] Using {device} | CUDA devices: {torch.cuda.device_count()} | TrainSets={train_sets}")
 
     # Build config / model
