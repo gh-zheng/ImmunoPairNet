@@ -1,14 +1,21 @@
-# train_bcr_classifier.py  (multi-dataset training + simple flags + DP)
+# train_classifier.py — DDP trainer supporting CUDA & XPU, AMP, grad clipping, rank-0 I/O, and cache freeing
 import os, random, json, time
+from datetime import timedelta
 from typing import Tuple, Any, Dict
+
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 
-# ---- model & config (your file) ----
+# ---- model & config (your files) ----
+
 from classification import load_default_config, build_embedder, build_classifier, PairAwareClassifier
 
-# ---- datasets (your file) ----
+
+# ---- datasets (your files) ----
 from Panimmnue_dataload import (
     IEDBRetrainMHCDataset, collate_mhc_panimmune,
     IntegratedTCRDataset,   collate_tcr_panimmune,
@@ -22,9 +29,9 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-EPOCHS = 30
-BATCH_SIZE = 8                # per-step batch for any dataset
-LR = 3e-4
+EPOCHS = 10
+BATCH_SIZE = 8
+BASE_LR = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 NUM_WORKERS = 4
@@ -40,200 +47,340 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 CONFIG_OUT = os.path.join(SAVE_DIR, "config.json")
 SAVE_EVERY = 1
 
-# ============================= Utils ============================= #
-def pick_device():
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return torch.device("xpu")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
+# ============================= Utilities ============================= #
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(False)
 
-@torch.no_grad()
-def smoke_test(model: nn.Module, dl: DataLoader, name: str):
-    if dl is None:
-        return
-    try:
-        batch_samples, labels, _ = next(iter(dl))
-    except StopIteration:
-        print(f"[{name}] dataset empty — skipping.")
-        return
-    logits = model(batch_samples)
-    print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | labels={tuple(labels.shape)}")
+def is_xpu_available() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
 
-def save_embedder_only(embedder: nn.Module, path: str):
-    torch.save({"state_dict": embedder.state_dict()}, path)
+def current_device(local_rank: int) -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda", local_rank)
+    if is_xpu_available():
+        return torch.device("xpu", local_rank)
+    return torch.device("cpu")
 
-def save_classification_head_only(model: PairAwareClassifier, path: str):
-    head_state = {k: v for k, v in model.state_dict().items() if not k.startswith("embedder.")}
-    torch.save({"state_dict": head_state}, path)
+def free_device_cache(device: torch.device):
+    """Release unoccupied cache; call BEFORE training and AFTER each epoch."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    elif device.type == "xpu" and is_xpu_available():
+        try:
+            torch.xpu.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.xpu.empty_cache()
+        except Exception:
+            pass
+    else:
+        import gc
+        gc.collect()
+
+# AMP helpers that gracefully degrade if a backend lacks AMP classes
+class _NullScaler:
+    def __init__(self, enabled: bool = False): self.enabled = False
+    def scale(self, x): return x
+    def unscale_(self, _): pass
+    def step(self, opt): opt.step()
+    def update(self): pass
+
+def amp_autocast(device: torch.device):
+    """Return the correct autocast context manager for device, or a no-op."""
+    if device.type == "cuda":
+        return torch.cuda.amp.autocast()
+    if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
+        return torch.xpu.amp.autocast()  # Intel extension
+    # no-op context manager
+    from contextlib import nullcontext
+    return nullcontext()
+
+def amp_scaler(device: torch.device, enabled: bool):
+    """Return a GradScaler for device if available, else a no-op scaler."""
+    if not enabled:
+        return _NullScaler()
+    if device.type == "cuda":
+        return torch.cuda.amp.GradScaler(enabled=True)
+    if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
+        # Intel extension provides its own GradScaler
+        return torch.xpu.amp.GradScaler(enabled=True)
+    return _NullScaler()
+
+# ============================= DDP helpers ============================= #
+def init_distributed():
+    """Initialize torch.distributed with a sensible backend for CUDA/XPU."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    global_rank = int(os.environ.get("RANK", "0"))
+    device = current_device(local_rank)
+
+    backend = None
+    if world_size > 1:
+        if device.type == "cuda":
+            backend = "nccl"
+            torch.cuda.set_device(local_rank)
+        elif device.type == "xpu":
+            # Prefer 'ccl' when oneCCL is installed; allow override via env
+            backend = os.environ.get("TORCH_DDP_BACKEND", "ccl")
+            try:
+                if hasattr(torch, "xpu"):
+                    torch.xpu.set_device(local_rank)
+            except Exception:
+                pass
+        else:
+            backend = "gloo"
+
+        try:
+            dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600))
+            is_ddp = True
+        except Exception as e:
+            # Fallback to single-process if DDP init fails
+            if global_rank == 0:
+                print(f"[DDP] Failed to init backend='{backend}': {e}. Falling back to single process.")
+            is_ddp = False
+    else:
+        is_ddp = False
+
+    return is_ddp, world_size, global_rank, local_rank, device, backend
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+def barrier_if_distributed(is_ddp: bool):
+    if is_ddp and dist.is_initialized():
+        dist.barrier()
+
+def dist_mean_scalar(x: float, device: torch.device, is_ddp: bool) -> float:
+    """Synchronize scalar averages across ranks."""
+    if not is_ddp or not dist.is_initialized():
+        return x
+    t = torch.tensor([x], dtype=torch.float32, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    t /= dist.get_world_size()
+    return float(t.item())
 
 # ============================= Data helpers ============================= #
-def make_dataset_and_loader(kind: str, path: str, batch_size: int) -> Tuple[Any, DataLoader]:
-    """
-    Build a dataset + dataloader for the given kind ('mhc' | 'tcr' | 'ab').
-    Returns (dataset, dataloader). Raises FileNotFoundError if missing.
-    """
+def build_dataset(kind: str, path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"[{kind}] Missing file: {path}")
-
     if kind == "mhc":
         ds = IEDBRetrainMHCDataset(path, binarize=False, threshold=0.5)
-        if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
-        dl = DataLoader(
-            ds, batch_size=batch_size, shuffle=True, collate_fn=collate_mhc_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS, drop_last=True
-        )
     elif kind == "tcr":
         ds = IntegratedTCRDataset(path, binarize=False, threshold=0.5)
-        if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
-        dl = DataLoader(
-            ds, batch_size=batch_size, shuffle=True, collate_fn=collate_tcr_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS, drop_last=True
-        )
     elif kind == "ab":
         ds = IntegratedAntibodyDataset(path, require_light=False, binarize=False, threshold=0.5)
-        if LOCAL_TEST_100: ds = Subset(ds, list(range(min(1, len(ds)))))
-        dl = DataLoader(
-            ds, batch_size=batch_size, shuffle=True, collate_fn=collate_antibody_panimmune,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY, persistent_workers=PERSISTENT_WORKERS, drop_last=True
-        )
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
-    return ds, dl
+    if LOCAL_TEST_100:
+        ds = Subset(ds, list(range(min(1, len(ds)))))
+    return ds
 
-# ============================= Train loop (per-dataloader) ============================= #
-def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, grad_clip_norm: float) -> Tuple[float, float]:
+def make_loader(kind: str, ds, batch_size: int, is_ddp: bool):
+    sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
+    if kind == "mhc":
+        collate_fn = collate_mhc_panimmune
+    elif kind == "tcr":
+        collate_fn = collate_tcr_panimmune
+    else:
+        collate_fn = collate_antibody_panimmune
+    dl = DataLoader(
+        ds, batch_size=batch_size, shuffle=(sampler is None),
+        sampler=sampler, collate_fn=collate_fn,
+        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+        persistent_workers=PERSISTENT_WORKERS, drop_last=True
+    )
+    return dl, sampler
+
+# ============================= Training functions ============================= #
+def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, grad_clip_norm: float, use_amp: bool):
     total, correct, total_loss = 0, 0, 0.0
+    scaler = amp_scaler(device, enabled=use_amp)
+
     for batch_samples, labels, _ in dl:
         labels = labels.to(device, non_blocking=True)
-
-        logits = model(batch_samples)     # [B, 2]
-        loss = loss_fn(logits, labels)
-
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip_norm is not None:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        opt.step()
+
+        with amp_autocast(device):
+            logits = model(batch_samples)    # model handles encoding & internal device use
+            loss = loss_fn(logits, labels)
+
+        if isinstance(scaler, _NullScaler):
+            loss.backward()
+            if grad_clip_norm:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            opt.step()
+        else:
+            scaler.scale(loss).backward()
+            if grad_clip_norm:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(opt)
+            scaler.update()
 
         with torch.no_grad():
             preds = logits.argmax(dim=1)
             total += labels.numel()
             correct += (preds == labels).sum().item()
             total_loss += float(loss.item()) * labels.size(0)
-    epoch_loss = total_loss / max(total, 1)
-    epoch_acc = correct / max(total, 1)
-    return epoch_loss, epoch_acc
 
-# ============================= Main (controlled by simple flags below) ============================= #
-def run_training(train_sets: list, epochs: int = EPOCHS, batch_size: int = BATCH_SIZE,
-                 lr: float = LR, weight_decay: float = WEIGHT_DECAY, save_every: int = SAVE_EVERY,
-                 save_dir: str = SAVE_DIR, config_out: str = CONFIG_OUT):
-    # Seed & device
+    return total_loss / max(total, 1), correct / max(total, 1)
+
+@torch.no_grad()
+def smoke_test(model, dl, name, device, do_print=True):
+    try:
+        batch_samples, labels, _ = next(iter(dl))
+    except StopIteration:
+        if do_print:
+            print(f"[{name}] dataset empty — skipping.")
+        return
+    labels = labels.to(device, non_blocking=True)
+    logits = model(batch_samples)
+    if do_print:
+        print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | labels={tuple(labels.shape)}")
+
+# ============================= Main training loop ============================= #
+def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
+                 lr=BASE_LR, weight_decay=WEIGHT_DECAY, save_every=SAVE_EVERY,
+                 save_dir=SAVE_DIR, config_out=CONFIG_OUT):
+
     set_seed(SEED)
-    device = pick_device()
+    is_ddp, world_size, global_rank, local_rank, device, backend = init_distributed()
+    is_main = is_main_process(global_rank)
+
+    # Perf knobs
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    elif device.type == "xpu":
-        # No cuDNN on Intel GPUs; optional XPU sync calls in your loops if needed:
-        pass
-    print(f"[Device] Using {device} | CUDA devices: {torch.cuda.device_count()} | TrainSets={train_sets}")
+    use_amp = device.type in ("cuda", "xpu")  # enable AMP on CUDA and XPU (if available)
 
-    # Build config / model
+    if is_main:
+        print(f"[Init] DDP={is_ddp} backend={backend} world_size={world_size} local_rank={local_rank} device={device} | TrainSets={train_sets}")
+
+    # ==== Build model ====
     cfg = load_default_config()
-    cfg.embedder.freeze_esm = False  
+    cfg.embedder.freeze_esm = False
     embedder = build_embedder(cfg.embedder, device=device)
     model = build_classifier(embedder, cfg.classifier, device=device)
 
-    # Multi-GPU (DataParallel)
-    if torch.cuda.device_count() > 1:
-        print(f"[Parallel] Using {torch.cuda.device_count()} GPUs via DataParallel")
-        model = nn.DataParallel(model)
+    if is_ddp:
+        ddp_kwargs = {"device_ids": [local_rank]} if device.type != "cpu" else {}
+        model = DDP(model, find_unused_parameters=False, **ddp_kwargs)
 
-    # Optimizer / loss
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss()
 
-    # Build loaders for selected datasets
-    loaders: Dict[str, DataLoader] = {}
+    # ==== Build loaders ====
+    loaders, samplers, sizes = {}, {}, {}
     for kind in train_sets:
         try:
-            _, dl = make_dataset_and_loader(kind, DATA_PATHS[kind], batch_size)
-            loaders[kind] = dl
+            ds = build_dataset(kind, DATA_PATHS[kind])
+            sizes[kind] = len(ds)
+            dl, sampler = make_loader(kind, ds, batch_size, is_ddp)
+            loaders[kind], samplers[kind] = dl, sampler
         except FileNotFoundError as e:
-            print(e)
+            if is_main:
+                print(e)
 
     if not loaders:
-        raise RuntimeError("No datasets available to train on. Please check file paths.")
+        raise RuntimeError("No datasets found!")
 
-    # Optional smoke tests
-    model.eval()
-    with torch.no_grad():
-        for kind, dl in loaders.items():
-            smoke_test(model, dl, f"{kind.upper()}(train)")
+    if is_main:
+        for k, sz in sizes.items():
+            print(f"[Data] {k}: {sz} samples (per-rank batch={batch_size})")
 
-    # Train
-    model.train()
+    # ==== Optional smoke test (rank-0) ====
+    if DO_SMOKE_TEST and is_main:
+        model.eval()
+        for k, dl in loaders.items():
+            smoke_test(model, dl, f"{k.upper()}(train)", device)
+        model.train()
+
+    # >>>>>>>>>> EMPTY CACHE BEFORE TRAINING <<<<<<<<<<
+    barrier_if_distributed(is_ddp)
+    free_device_cache(device)
+
+    # ==== Train loop ====
     for epoch in range(1, epochs + 1):
-        print(f"\n=== Epoch {epoch} ===")
+        # distinct shuffles across epochs (DDP)
+        for k, sampler in samplers.items():
+            if isinstance(sampler, DistributedSampler):
+                sampler.set_epoch(epoch)
+
+        if is_main:
+            print(f"\n=== Epoch {epoch} ===")
         per_ds_metrics = {}
         start = time.time()
 
-        for kind, dl in loaders.items():
-            ds_loss, ds_acc = train_one_loader(model, dl, loss_fn, opt, device, GRAD_CLIP_NORM)
-            per_ds_metrics[kind] = (ds_loss, ds_acc)
-            print(f"[{kind}] loss={ds_loss:.4f}  acc={ds_acc:.3f}")
+        model.train()
+        for k, dl in loaders.items():
+            loss_local, acc_local = train_one_loader(model, dl, loss_fn, opt, device, GRAD_CLIP_NORM, use_amp)
+            # reduce to global means
+            loss_avg = dist_mean_scalar(loss_local, device, is_ddp)
+            acc_avg  = dist_mean_scalar(acc_local,  device, is_ddp)
+            per_ds_metrics[k] = (loss_avg, acc_avg)
+            if is_main:
+                print(f"[{k}] loss={loss_avg:.4f}  acc={acc_avg:.3f}")
 
-        # macro-average across datasets
+        # average across datasets
         avg_loss = sum(l for l, _ in per_ds_metrics.values()) / len(per_ds_metrics)
         avg_acc  = sum(a for _, a in per_ds_metrics.values()) / len(per_ds_metrics)
-        dt = time.time() - start
-        print(f"[avg]  loss={avg_loss:.4f}  acc={avg_acc:.3f}  time={dt:.1f}s")
+        if is_main:
+            print(f"[avg] loss={avg_loss:.4f} acc={avg_acc:.3f} time={time.time()-start:.1f}s")
 
-        # periodic save (unwrap DP if needed)
-        if epoch % save_every == 0:
-            msave = model.module if isinstance(model, nn.DataParallel) else model
+        # save checkpoints (rank 0)
+        if (epoch % save_every == 0) and is_main:
+            msave = model.module if isinstance(model, DDP) else model
             emb_path = os.path.join(save_dir, f"embedder_epoch{epoch}.pt")
             cls_path = os.path.join(save_dir, f"classification_epoch{epoch}.pt")
-            save_embedder_only(msave.embedder, emb_path)
-            save_classification_head_only(msave, cls_path)
-            print(f"Saved: {emb_path}  |  {cls_path}")
+            torch.save({"state_dict": msave.embedder.state_dict()}, emb_path)
+            head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embedder.")}
+            torch.save({"state_dict": head_state}, cls_path)
+            print(f"Saved: {emb_path} | {cls_path}")
 
-    # final save
-    msave = model.module if isinstance(model, nn.DataParallel) else model
-    emb_path = os.path.join(save_dir, f"embedder_final.pt")
-    cls_path = os.path.join(save_dir, f"classification_final.pt")
-    save_embedder_only(msave.embedder, emb_path)
-    save_classification_head_only(msave, cls_path)
-    print(f"Saved final: {emb_path}  |  {cls_path}")
+        # sync and free memory caches AFTER each epoch
+        barrier_if_distributed(is_ddp)
+        free_device_cache(device)
 
-    # write config
-    with open(config_out, "w") as f:
-        json.dump({
-            "embedder": cfg.embedder.__dict__,
-            "classifier": cfg.classifier.__dict__,
-            "train": {
-                "epochs": epochs, "batch_size": batch_size,
-                "lr": lr, "weight_decay": weight_decay, "seed": SEED,
-                "grad_clip_norm": GRAD_CLIP_NORM, "local_test_100": LOCAL_TEST_100,
-                "train_sets": train_sets
-            }
-        }, f, indent=2)
-    print(f"Saved config to {config_out}")
+    # ==== Final save ====
+    barrier_if_distributed(is_ddp)
+    free_device_cache(device)
 
-# ============================= Simple switches here ============================= #
+    if is_main:
+        msave = model.module if isinstance(model, DDP) else model
+        emb_path = os.path.join(save_dir, "embedder_final.pt")
+        cls_path = os.path.join(save_dir, "classification_final.pt")
+        torch.save({"state_dict": msave.embedder.state_dict()}, emb_path)
+        head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embedder.")}
+        torch.save({"state_dict": head_state}, cls_path)
+        print(f"Saved final: {emb_path} | {cls_path}")
+
+        # config dump
+        with open(config_out, "w") as f:
+            json.dump({
+                "embedder": cfg.embedder.__dict__,
+                "classifier": cfg.classifier.__dict__,
+                "train": {
+                    "epochs": epochs, "batch_size_per_rank": batch_size,
+                    "lr": lr, "weight_decay": weight_decay, "seed": SEED,
+                    "grad_clip_norm": GRAD_CLIP_NORM, "local_test_100": LOCAL_TEST_100,
+                    "train_sets": train_sets, "world_size": world_size, "backend": backend
+                }
+            }, f, indent=2)
+        print(f"Saved config to {config_out}")
+
+    if is_ddp and dist.is_initialized():
+        dist.destroy_process_group()
+
+# ============================= Entrypoint ============================= #
 if __name__ == "__main__":
-    # ---- Edit these two lines to control training sets ----
-    MHC_ONLY   = True              # if True, forces training on MHC only
-    TRAIN_SETS = ["mhc", "tcr", "ab"]    # used only when MHC_ONLY is False; choose any of: "mhc", "tcr", "ab"
-
+    MHC_ONLY = True
+    TRAIN_SETS = ["mhc", "tcr", "ab"]
     selected_sets = ["mhc"] if MHC_ONLY else TRAIN_SETS
     run_training(train_sets=selected_sets)

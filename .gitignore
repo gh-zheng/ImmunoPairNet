@@ -3,3 +3,4 @@ cmai-data/*
 classify.py
 /data/*.csv
 /model_parameter/*
+esm2_token_embeddings_650M.pkl.gz

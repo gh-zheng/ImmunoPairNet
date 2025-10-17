@@ -42,7 +42,7 @@ class PanimmuneEmbedderPairs(nn.Module):
     """
     def __init__(
         self,
-        esm_model_name: str = "facebook/esm2_t33_650M_UR50D",
+        esm_model_name: str = "facebook/esm2_t6_8M_UR50D",
         pairformer_blocks: int = 4,
         pair_c: int = 128,
         allow_inter_chain: bool = False,        # cross-seq mixing *within* a sample
