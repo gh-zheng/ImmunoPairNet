@@ -16,6 +16,10 @@ class EmbedderConfig:
     cache_size: Optional[int] = 200_000
     use_amp: Optional[bool] = True
     max_length: Optional[int] = None
+    precomputed_pkl_gz: str="esm2_token_embeddings_650M_long.pkl.gz"
+    precomputed_shards_dir: str = None  # or None
+    strict_model_match: bool=True
+    seq_normalize:bool=False
 
 @dataclass
 class ClassifierConfig:

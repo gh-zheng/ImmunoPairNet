@@ -4,3 +4,5 @@ classify.py
 /data/*.csv
 /model_parameter/*
 esm2_token_embeddings_650M.pkl.gz
+esm2_token_embeddings_650M_long.pkl.gz
+esm_shards/*

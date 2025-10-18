@@ -49,7 +49,7 @@ def forward_with_checkpointing(
     """Run the blocks with gradient checkpointing."""
     if not torch.is_grad_enabled():
         blocks_per_ckpt = None
-
+    blocks_per_ckpt = None
     # Run with grad checkpointing
     return checkpoint_blocks(
         blocks,

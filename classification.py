@@ -89,6 +89,10 @@ def build_embedder(cfg: EmbedderConfig, device: Optional[torch.device] = None) -
         allow_inter_chain=cfg.allow_inter_chain,
         attn_from_last_layer_only=cfg.attn_from_last_layer_only,
         torch_dtype=_maybe_cast_dtype(cfg.torch_dtype),
+        precomputed_pkl_gz=cfg.precomputed_pkl_gz,
+        precomputed_shards_dir=cfg.precomputed_shards_dir,  # or None
+        strict_model_match=cfg.strict_model_match,
+        seq_normalize=cfg.seq_normalize,
     )
 
     # Optional / optimized kwargs: only pass if supported

@@ -1,6 +1,10 @@
 # panimmune_embedder_pairs_optimized.py
 from typing import List, Tuple, Dict, Any, Optional
 from collections import OrderedDict
+import os, gzip, pickle
+from glob import glob
+
+import numpy as np
 import torch
 import torch.nn as nn
 from transformers import EsmTokenizer, EsmModel
@@ -31,29 +35,40 @@ class _LRUSeqCache:
             self.store.popitem(last=False)
 
 
+def _load_pickle_gz(path: str) -> Any:
+    with gzip.open(path, "rb") as f:
+        return pickle.load(f)
+
+
 class PanimmuneEmbedderPairs(nn.Module):
     """
-    Optimized version:
-      - Batch ESM encodes by sequence position across the batch (A group, B group, ...).
-      - Tokenizer padding/truncation with pad_to_multiple_of=8.
+    Optimized version with optional precomputation:
+      - Uses precomputed ESM token embeddings & attentions when available.
+      - Falls back to live ESM encoding otherwise.
+      - Batch ESM encodes by sequence position across the batch.
       - AMP for ESM forward, dtype-safe padding for s/z.
       - Optional caching for repeated sequences (CPU offload).
       - Block-diagonal z per sample, optional inter-chain mixing via pair_mask.
     """
     def __init__(
         self,
-        esm_model_name: str = "facebook/esm2_t6_8M_UR50D",
-        pairformer_blocks: int = 4,
+        esm_model_name: str = "facebook/esm2_t33_650M_UR50D",
+        pairformer_blocks: int = 12,
         pair_c: int = 128,
-        allow_inter_chain: bool = False,        # cross-seq mixing *within* a sample
+        allow_inter_chain: bool = False,
         attn_from_last_layer_only: bool = True,
-        torch_dtype: Optional[torch.dtype] = None,  # e.g., torch.bfloat16/float16 on GPU
-        max_length: Optional[int] = None,       # cap for tokenizer; defaults to ESM's pos-emb if None
+        torch_dtype: Optional[torch.dtype] = None,
+        max_length: Optional[int] = None,
         pad_to_multiple_of: int = 8,
         enable_cache: bool = True,
         cache_size: int = 100_000,
-        freeze_esm: bool = True,                # disable grads for ESM
-        use_amp: bool = True,                   # autocast around ESM forward
+        freeze_esm: bool = True,
+        use_amp: bool = True,
+        # -------- NEW OPTIONALS (don’t break existing callers) --------
+        precomputed_pkl_gz: Optional[str] = None,       # e.g., "esm2_token_embeddings_650M_long.pkl.gz"
+        precomputed_shards_dir: Optional[str] = None,   # e.g., "esm_shards" (files: shard_*.pkl.gz)
+        strict_model_match: bool = True,                # require meta['esm_model'] == esm_model_name
+        seq_normalize: bool = False,                    # normalize seq keys if your sources differ
     ):
         super().__init__()
         self.tokenizer = EsmTokenizer.from_pretrained(esm_model_name)
@@ -86,6 +101,15 @@ class PanimmuneEmbedderPairs(nn.Module):
         self._cache = _LRUSeqCache(max_size=cache_size) if enable_cache else None
         self.register_buffer("_device_anchor", torch.empty(0))
 
+        # Precomputed stores (CPU numpy → converted on demand)
+        self._pre_tok: Dict[str, np.ndarray] = {}
+        self._pre_attn: Optional[Dict[str, np.ndarray]] = None
+        self._pre_meta: Dict[str, Any] = {}
+        self._seq_normalize = seq_normalize
+        self._strict_model_match = strict_model_match
+        if precomputed_pkl_gz or precomputed_shards_dir:
+            self._load_precomputed(precomputed_pkl_gz, precomputed_shards_dir, esm_model_name)
+
         # Fast attention & TF32 friendly settings (safe no-ops on CPU)
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -96,8 +120,66 @@ class PanimmuneEmbedderPairs(nn.Module):
         except Exception:
             pass
 
-    # ---------- encoding helpers ----------
+    # ---------- precompute helpers ----------
+    def _norm_key(self, s: str) -> str:
+        if not isinstance(s, str):
+            return ""
+        s = s.strip()
+        if self._seq_normalize:
+            s = s.upper()
+        return s
 
+    def _verify_meta(self, meta: Dict[str, Any], current_model: str) -> bool:
+        if not self._strict_model_match:
+            return True
+        m = meta.get("esm_model", None)
+        return str(m) == str(current_model)
+
+    def _merge_payload(self, payload: Dict[str, Any]):
+        # Merge embeddings
+        emb = payload.get("embeddings", {})
+        for k, v in emb.items():
+            self._pre_tok[self._norm_key(k)] = v  # numpy arrays kept on CPU
+        # Merge attentions (optional)
+        if "attentions" in payload:
+            if self._pre_attn is None:
+                self._pre_attn = {}
+            for k, v in payload["attentions"].items():
+                self._pre_attn[self._norm_key(k)] = v
+        # Keep last meta
+        self._pre_meta = payload.get("meta", {}) or self._pre_meta
+
+    def _load_precomputed(self, pkl_path: Optional[str], shards_dir: Optional[str], current_model: str):
+        try:
+            if shards_dir:
+                shard_files = sorted(glob(os.path.join(shards_dir, "shard_*.pkl.gz")))
+                for sp in shard_files:
+                    part = _load_pickle_gz(sp)
+                    # If strict, skip incompatible shards
+                    meta = part.get("meta", {})
+                    if not self._verify_meta(meta, current_model):
+                        continue
+                    self._merge_payload(part)
+            if pkl_path and os.path.isfile(pkl_path):
+                part = _load_pickle_gz(pkl_path)
+                meta = part.get("meta", {})
+                if self._verify_meta(meta, current_model):
+                    self._merge_payload(part)
+
+            # Sanity: verify hidden sizes if present
+            hs_file = self._pre_meta.get("hidden_size", None)
+            if hs_file is not None and int(hs_file) != int(self.esm.config.hidden_size):
+                # If hidden size mismatches, we cannot reuse token embeddings safely
+                # Keep attentions if they exist (we can still project those), but drop tokens
+                self._pre_tok.clear()
+
+        except Exception as e:
+            print(f"[precompute] failed to load: {e}. Ignoring precomputed data.")
+            self._pre_tok.clear()
+            self._pre_attn = None
+            self._pre_meta = {}
+
+    # ---------- encoding helpers ----------
     def _encode_group_batched(
         self,
         seqs_in: List[str],
@@ -108,35 +190,87 @@ class PanimmuneEmbedderPairs(nn.Module):
         Returns:
           tokens_list: list of [Li, C_s] tensors
           atts_list:   list of [Li, Li, C_z] tensors
-        Uses cache for repeated sequences, runs ESM only for uncached ones.
+        Uses precomputed values when available, then cache, then ESM.
         """
         # Filter out empties early
         seqs = [(i, s) for i, s in enumerate(seqs_in) if isinstance(s, str) and len(s) > 0]
         if not seqs:
             return [], []
 
-        # Split into cached vs to-encode
-        cached_out: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        to_encode_idx: List[int] = []
-        to_encode_strs: List[str] = []
-        if self.enable_cache:
-            for i, s in seqs:
-                got = self._cache.get(s)
-                if got is not None:
-                    cached_out[i] = got
-                else:
-                    to_encode_idx.append(i)
-                    to_encode_strs.append(s)
-        else:
-            for i, s in seqs:
-                to_encode_idx.append(i)
-                to_encode_strs.append(s)
+        # First pass: try precomputed
+        tokens_list: List[torch.Tensor] = [None] * len(seqs)  # type: ignore
+        atts_list: List[torch.Tensor] = [None] * len(seqs)    # type: ignore
+        need_encode_idx: List[int] = []
+        need_encode_strs: List[str] = []
 
-        # Run ESM for the not-yet-cached sequences (batched)
-        encoded_new: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
-        if len(to_encode_strs) > 0:
+        H_current = int(self.esm.config.num_attention_heads)
+        C_s_current = int(self.esm.config.hidden_size)
+        for pos, s in seqs:
+            key = self._norm_key(s)
+            took = False
+            # 1) exact precomputed tensors (embeddings + attentions)
+            if key and key in self._pre_tok:
+                tok_np = self._pre_tok[key]  # [L, C_s_pre]
+                if tok_np.ndim == 2 and tok_np.shape[1] == C_s_current:
+                    # tokens OK
+                    t = torch.from_numpy(tok_np).to(device=device, dtype=self.esm.dtype if hasattr(self.esm, "dtype") and self.esm.dtype.is_floating_point else torch.float32)
+                    # attentions
+                    if self._pre_attn is not None and key in self._pre_attn:
+                        A_np = self._pre_attn[key]
+                        if A_np.ndim == 2:
+                            # [L, L] (last_mean) -> expand to [L, L, H_current]
+                            A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32).unsqueeze(-1).repeat(1, 1, H_current)
+                        elif A_np.ndim == 3:
+                            # Could be [H, L, L] or [L, L, H]
+                            if A_np.shape[0] == H_current:
+                                # [H, L, L] -> [L, L, H]
+                                A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32).permute(1, 2, 0).contiguous()
+                            elif A_np.shape[-1] == H_current:
+                                # already [L, L, H]
+                                A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32)
+                            else:
+                                # head mismatch; fallback to mean across any head axis
+                                A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32)
+                                if A.shape[0] == A.shape[1]:
+                                    # ambiguous; treat as [L, L] by averaging over dim0 if needed
+                                    A = A.mean(dim=0, keepdim=False)
+                                    A = A.unsqueeze(-1).repeat(1, 1, H_current)
+                                else:
+                                    # assume [H?, L, L]
+                                    A = A.mean(dim=0).permute(1, 2, 0)
+                        else:
+                            # Unknown shape: make zeros to keep batch moving
+                            L = t.shape[0]
+                            A = torch.zeros((L, L, H_current), device=device, dtype=torch.float32)
+                    else:
+                        # No precomputed attention; fabricate simple diagonal (neutral) to project
+                        L = t.shape[0]
+                        A = torch.zeros((L, L, H_current), device=device, dtype=torch.float32)
+
+                    z = self.project_z(A)  # [L, L, C_z]
+
+                    tokens_list[pos] = t
+                    atts_list[pos] = z
+                    took = True
+            if not took:
+                # 2) cache (CPU) check
+                if self.enable_cache:
+                    got = self._cache.get(s)
+                    if got is not None:
+                        h_i, z_i = got
+                        tokens_list[pos] = h_i.to(device, non_blocking=True)
+                        atts_list[pos] = z_i.to(device, non_blocking=True)
+                        continue
+
+                # 3) mark for live ESM encode
+                need_encode_idx.append(pos)
+                need_encode_strs.append(s)
+
+        # Live ESM for those still missing
+        if len(need_encode_strs) > 0:
+            raise
             tok = self.tokenizer(
-                to_encode_strs,
+                need_encode_strs,
                 return_tensors="pt",
                 add_special_tokens=True,
                 padding=True,
@@ -146,11 +280,10 @@ class PanimmuneEmbedderPairs(nn.Module):
             )
             tok = {k: v.to(device, non_blocking=True) for k, v in tok.items()}
 
-            # AMP around ESM if enabled
+            # AMP around ESM if enabled (CUDA)
             if self.use_amp and device.type == "cuda":
-                amp_ctx = torch.autocast(device_type="cuda", dtype=self.esm.dtype if self.esm.dtype.is_floating_point else torch.bfloat16)
+                amp_ctx = torch.autocast(device_type="cuda", dtype=self.esm.dtype if getattr(self.esm, "dtype", torch.float32).is_floating_point else torch.bfloat16)
             else:
-                # dummy context manager
                 class _NoOp:
                     def __enter__(self): return None
                     def __exit__(self, *args): return False
@@ -171,41 +304,35 @@ class PanimmuneEmbedderPairs(nn.Module):
 
             for j in range(hidden.size(0)):
                 S_j = int(S_vec[j].item())
-                if S_j <= 2:  # only BOS/EOS or pathological
-                    # Make zero shapes that match dtypes
+                if S_j <= 2:
                     c_s = hidden.shape[-1]
                     c_z = self.project_z.out_features
                     h_j = hidden.new_zeros((0, c_s))
                     z_j = hidden.new_zeros((0, 0, c_z))
                 else:
                     # strip BOS/EOS
-                    h_j = hidden[j, 1:S_j-1, :]                   # [L, C_s]
-                    a_j = attn_all[j, :, 1:S_j-1, 1:S_j-1]        # [H, L, L]
-                    a_j = a_j.permute(1, 2, 0).contiguous()       # [L, L, H]
-                    z_j = self.project_z(a_j)                     # [L, L, C_z]
+                    h_j = hidden[j, 1:S_j-1, :]                         # [L, C_s]
+                    a_j = attn_all[j, :, 1:S_j-1, 1:S_j-1]              # [H, L, L]
+                    a_j = a_j.permute(1, 2, 0).contiguous()             # [L, L, H]
+                    z_j = self.project_z(a_j)                           # [L, L, C_z]
 
-                # Offload to CPU for caching (saves VRAM)
+                pos = need_encode_idx[j]
+                tokens_list[pos] = h_j
+                atts_list[pos] = z_j
+
+                # Offload to CPU cache
                 if self.enable_cache:
-                    self._cache.put(to_encode_strs[j], (h_j.detach().cpu(), z_j.detach().cpu()))
+                    self._cache.put(need_encode_strs[j], (h_j.detach().cpu(), z_j.detach().cpu()))
 
-                encoded_new[to_encode_idx[j]] = (h_j, z_j)
+        # Compact (remove Nones) preserving the original order of non-empty seqs
+        final_tokens, final_atts = [], []
+        for (pos, _s) in seqs:
+            final_tokens.append(tokens_list[pos])
+            final_atts.append(atts_list[pos])
 
-        # Stitch outputs in the input order (only for non-empty items)
-        tokens_list: List[torch.Tensor] = []
-        atts_list: List[torch.Tensor] = []
-        for i, _s in seqs:
-            pair = cached_out.get(i, None)
-            if pair is None:
-                pair = encoded_new[i]
-            h_i, z_i = pair
-            # Move to target device (non_blocking) in case they came from CPU cache
-            tokens_list.append(h_i.to(device, non_blocking=True))
-            atts_list.append(z_i.to(device, non_blocking=True))
-
-        return tokens_list, atts_list
+        return final_tokens, final_atts
 
     # ---------- main forward ----------
-
     def forward(
         self,
         batch_pairs: List[List[str]],               # e.g., [["heavy","light","antigen"], ["heavy","antigen"], ...]
@@ -244,7 +371,6 @@ class PanimmuneEmbedderPairs(nn.Module):
         group_tokens: List[List[torch.Tensor]] = []
         group_atts: List[List[torch.Tensor]] = []
         for k in range(K):
-            # Remove empties for compute; we will re-associate by consuming in order later
             non_empty = [s for s in grouped[k] if isinstance(s, str) and len(s) > 0]
             if len(non_empty) == 0:
                 group_tokens.append([])
@@ -259,20 +385,16 @@ class PanimmuneEmbedderPairs(nn.Module):
         offsets_per_sample, lengths = [], []
         g_ptrs = [0] * K  # pointers within each encoded group list
 
-        # dtype inference for final padded tensors
-        # We'll sniff dtype from the first produced token tensor
         inferred_dtype: Optional[torch.dtype] = None
 
         for b in range(B):
             s_blocks, z_blocks, offsets = [], [], []
             total = 0
             for k in range(K):
-                # skip empty slot
                 if k >= len(batch_pairs[b]) or not isinstance(batch_pairs[b][k], str) or len(batch_pairs[b][k]) == 0:
                     continue
-                # fetch next encoded tensor from group k (keeps sample order)
                 if g_ptrs[k] >= len(group_tokens[k]):
-                    continue  # safety
+                    continue
                 s_k = group_tokens[k][g_ptrs[k]]   # [Lk, C_s]
                 z_k = group_atts[k][g_ptrs[k]]     # [Lk, Lk, C_z]
                 g_ptrs[k] += 1
@@ -289,7 +411,6 @@ class PanimmuneEmbedderPairs(nn.Module):
                 total += Lk
 
             if total == 0:
-                # empty sample; push zero shapes
                 c_s = self.esm.config.hidden_size
                 c_z = self.project_z.out_features
                 dt = inferred_dtype or torch.float32
@@ -352,6 +473,9 @@ class PanimmuneEmbedderPairs(nn.Module):
             "offsets_per_sample": offsets_per_sample,
             "lengths": lengths,
             "Lmax": Lmax,
+            "precompute_used": (len(self._pre_tok) > 0),
+            "precompute_model": self._pre_meta.get("esm_model", None),
+            "precompute_attn_kind": self._pre_meta.get("attn_kind", None),
         }
         return s_out, z_out, (single_mask, pair_mask), meta
 
@@ -373,20 +497,11 @@ if __name__ == "__main__":
         cache_size=200_000,
         freeze_esm=True,                  # no grads for ESM
         use_amp=True,
+        # point these at your precompute:
+        precomputed_pkl_gz=r"esm2_token_embeddings_650M_long.pkl.gz",
+        precomputed_shards_dir=None,  # or None
+        strict_model_match=True,
+        seq_normalize=False,
     ).to(device)
+    print(model._encode_group_batched(["HLMGWDYPK", "MAVMPPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGRGEPRFIAVGYVDDTQFVRFDSDAASQRMEPRAPWIEQEGPEYWDQETRSAKAHSQTDRVDLGTLRGYYNQSEDGSHTIQIMYGCDVGSDGRFLRGYRQDAYDGKDYIALNEDLRSWTAADMAAQITKRKWEAAHAAEQQRAYLEGTCVEWLRRYLENGKETLQRTDPPKTHMTHHPISDHEATLRCWALGFYPAEITLTWQRDGEDQTQDTELVETRPAGDGTFQKWAAVVVPSGEEQRYTCHVQHEGLPKPLTLRWEPSSQPTIPIVGIIAGLVLLGAVITGAVVAAVMWRRKSSDRKGGSYTQAASSDSAQGSDVSLTACKV"], device=device))
 
-    # Example: two samples, each with variable # of sequences
-    batch_pairs = [
-        ["MKTAYIAKQRQISFVKSHFSRQDILDL", "GILGFVFTLTVPSER", "MAVMAPRTLVLLLSGALA"],
-        ["MKTAYIAKQRQISFVKSHFSRQDILDLI", "LLGATCMFVLMYFGT"],
-    ]
-
-    s, z, masks, meta = model(batch_pairs, return_metadata=True)
-
-    single_mask, pair_mask = masks
-    print("\n=== Pair-batch result ===")
-    print("B:", len(batch_pairs))
-    print("L per sample:", meta["lengths"], "Lmax:", meta["Lmax"])
-    print("s:", tuple(s.shape), "z:", tuple(z.shape))
-    print("single_mask:", tuple(single_mask.shape), "pair_mask:", tuple(pair_mask.shape))
-    print("offsets_per_sample:", meta["offsets_per_sample"])

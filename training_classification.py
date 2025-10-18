@@ -30,7 +30,7 @@ DATA_PATHS = {
 }
 
 EPOCHS = 10
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 BASE_LR = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
@@ -40,7 +40,7 @@ PERSISTENT_WORKERS = True
 SEED = 42
 
 DO_SMOKE_TEST = False
-LOCAL_TEST_100 = False
+LOCAL_TEST_100 = True
 
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -178,7 +178,7 @@ def build_dataset(kind: str, path: str):
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
     if LOCAL_TEST_100:
-        ds = Subset(ds, list(range(min(1, len(ds)))))
+        ds = Subset(ds, list(range(min(10, len(ds)))))
     return ds
 
 def make_loader(kind: str, ds, batch_size: int, is_ddp: bool):
@@ -205,7 +205,6 @@ def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, gra
     for batch_samples, labels, _ in dl:
         labels = labels.to(device, non_blocking=True)
         opt.zero_grad(set_to_none=True)
-
         with amp_autocast(device):
             logits = model(batch_samples)    # model handles encoding & internal device use
             loss = loss_fn(logits, labels)
@@ -265,13 +264,13 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
 
     # ==== Build model ====
     cfg = load_default_config()
-    cfg.embedder.freeze_esm = False
+    cfg.embedder.freeze_esm = True
     embedder = build_embedder(cfg.embedder, device=device)
     model = build_classifier(embedder, cfg.classifier, device=device)
 
     if is_ddp:
         ddp_kwargs = {"device_ids": [local_rank]} if device.type != "cpu" else {}
-        model = DDP(model, find_unused_parameters=False, **ddp_kwargs)
+        model = DDP(model, find_unused_parameters=True, **ddp_kwargs)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss()
