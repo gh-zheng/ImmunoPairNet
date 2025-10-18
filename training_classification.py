@@ -9,7 +9,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
-
+import gc
 # ---- model & config (your files) ----
 
 from classification import load_default_config, build_embedder, build_classifier, PairAwareClassifier
@@ -21,6 +21,40 @@ from Panimmnue_dataload import (
     IntegratedTCRDataset,   collate_tcr_panimmune,
     IntegratedAntibodyDataset, collate_antibody_panimmune,
 )
+
+
+def free_device_memory():
+    """
+    Safely clear Python refs + GPU/XPU caches.
+    Works with CUDA, XPU, or CPU backends.
+    """
+    gc.collect()  # clear Python garbage
+
+    if torch.backends.mps.is_available():  # Apple M1/M2
+        try:
+            torch.mps.empty_cache()
+            print("[Memory] Cleared MPS cache.")
+        except Exception:
+            pass
+
+    elif torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            print("[Memory] Cleared CUDA cache.")
+        except Exception:
+            pass
+
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        try:
+            torch.xpu.empty_cache()
+            torch.xpu.reset_peak_memory_stats()
+            print("[Memory] Cleared XPU cache.")
+        except Exception:
+            pass
+
+    else:
+        print("[Memory] CPU-only system — nothing to clear.")
 
 # ============================= Defaults ============================= #
 DATA_PATHS = {

@@ -1,6 +1,5 @@
-# panimmune_embedder_pairs_optimized.py
+# panimmune_embedder_pairs_chunked_precompute.py
 from typing import List, Tuple, Dict, Any, Optional
-from collections import OrderedDict
 import os, gzip, pickle
 from glob import glob
 
@@ -9,82 +8,64 @@ import torch
 import torch.nn as nn
 from transformers import EsmTokenizer, EsmModel
 
-# Ensure this import resolves in your project
-from src.models.pairformer import PairformerStack
-
-
-class _LRUSeqCache:
-    """
-    Very simple LRU cache for sequence -> (s_seq, z_seq) tensors.
-    Stores CPU tensors; moves to device on read.
-    """
-    def __init__(self, max_size: int = 100_000):
-        self.max_size = max_size
-        self.store: "OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
-
-    def get(self, key: str):
-        if key in self.store:
-            self.store.move_to_end(key)
-            return self.store[key]
-        return None
-
-    def put(self, key: str, value: Tuple[torch.Tensor, torch.Tensor]):
-        self.store[key] = value
-        self.store.move_to_end(key)
-        if len(self.store) > self.max_size:
-            self.store.popitem(last=False)
-
-
-def _load_pickle_gz(path: str) -> Any:
-    with gzip.open(path, "rb") as f:
-        return pickle.load(f)
-
 
 class PanimmuneEmbedderPairs(nn.Module):
     """
-    Optimized version with optional precomputation:
-      - Uses precomputed ESM token embeddings & attentions when available.
-      - Falls back to live ESM encoding otherwise.
-      - Batch ESM encodes by sequence position across the batch.
-      - AMP for ESM forward, dtype-safe padding for s/z.
-      - Optional caching for repeated sequences (CPU offload).
-      - Block-diagonal z per sample, optional inter-chain mixing via pair_mask.
+    ESM-2 encoder with:
+      • Optional precomputation of token embeddings/attentions (per-chain or full concatenated sequence keys)
+      • Chunk-and-stitch for >1k residues while preserving attentions
+      • Block-diagonal z (intra-chain), optional cross-chain mask
+      • Pairformer per-sample (no giant padded [B,Lmax,Lmax,Cz] before compute)
+
+    Precomputation usage order per sample:
+      1) If full concatenated key is present in precompute, use it directly.
+      2) Else, try to use precomputed per-chain values for all chains; if all present, assemble from them.
+      3) Else, encode only the missing chains with ESM; combine with precomputed chains.
+      4) If any chain exceeds ESM positional limit, chunk-and-stitch that chain.
     """
+
     def __init__(
         self,
-        esm_model_name: str = "facebook/esm2_t33_650M_UR50D",
-        pairformer_blocks: int = 12,
-        pair_c: int = 128,
-        allow_inter_chain: bool = False,
+        esm_model_name: str = "facebook/esm2_t6_8M_UR50D",
+        pairformer_blocks: int = 6,
+        pair_c: int = 32,
+        allow_inter_chain: bool = False,          # mask allows cross-chain; z off-diagonal remains zero in this module
         attn_from_last_layer_only: bool = True,
         torch_dtype: Optional[torch.dtype] = None,
-        max_length: Optional[int] = None,
-        pad_to_multiple_of: int = 8,
-        enable_cache: bool = True,
-        cache_size: int = 100_000,
         freeze_esm: bool = True,
         use_amp: bool = True,
-        # -------- NEW OPTIONALS (don’t break existing callers) --------
-        precomputed_pkl_gz: Optional[str] = None,       # e.g., "esm2_token_embeddings_650M_long.pkl.gz"
-        precomputed_shards_dir: Optional[str] = None,   # e.g., "esm_shards" (files: shard_*.pkl.gz)
-        strict_model_match: bool = True,                # require meta['esm_model'] == esm_model_name
-        seq_normalize: bool = False,                    # normalize seq keys if your sources differ
+        return_padded: bool = False,              # pad AFTER Pairformer only if required
+        # Chunking
+        window: int = 1000,
+        stride: int = 900,
+        proj_chunk_elems: int = 512_000,
+        # Precompute stores
+        precomputed_pkl_gz: Optional[str] = None,     # e.g., "esm2_precompute.pkl.gz"
+        precomputed_shards_dir: Optional[str] = None, # e.g., "esm_shards" with shard_*.pkl.gz
+        strict_model_match: bool = True,              # require meta.esm_model == esm_model_name
+        seq_normalize: bool = False,                  # normalize seq keys (upper/strip) if sources differ
+        pairformer_ctor=None,                         # inject if your Pairformer path differs
     ):
         super().__init__()
+
+        # --- ESM ---
         self.tokenizer = EsmTokenizer.from_pretrained(esm_model_name)
         self.esm = EsmModel.from_pretrained(
             esm_model_name, output_attentions=True, torch_dtype=torch_dtype
         )
-
-        # Optional: freeze ESM (no grads) for speed & memory
         if freeze_esm:
             self.esm.eval().requires_grad_(False)
         else:
             self.esm.train().requires_grad_(True)
 
-        self.project_z = nn.Linear(self.esm.config.num_attention_heads, pair_c)
+        # --- H->Cz projection for pair map ---
+        self.project_z = nn.Linear(self.esm.config.num_attention_heads, pair_c, bias=True)
 
-        self.pairformer = PairformerStack(
+        # --- Pairformer ---
+        if pairformer_ctor is None:
+            from src.models.pairformer import PairformerStack
+            pairformer_ctor = PairformerStack
+        self.pairformer = pairformer_ctor(
             c_s=self.esm.config.hidden_size,
             c_z=pair_c,
             no_blocks=pairformer_blocks,
@@ -93,24 +74,15 @@ class PanimmuneEmbedderPairs(nn.Module):
         self.allow_inter_chain = allow_inter_chain
         self.attn_from_last_layer_only = attn_from_last_layer_only
         self.use_amp = use_amp
-        self.pad_to_multiple_of = pad_to_multiple_of
-        self.max_length = max_length or getattr(self.esm.config, "max_position_embeddings", 1024)
+        self.return_padded = return_padded
+        self.window = int(window)
+        self.stride = int(stride)
+        self.proj_chunk_elems = int(proj_chunk_elems)
 
-        # Simple sequence cache (CPU)
-        self.enable_cache = enable_cache
-        self._cache = _LRUSeqCache(max_size=cache_size) if enable_cache else None
         self.register_buffer("_device_anchor", torch.empty(0))
+        self.max_pos = int(getattr(self.esm.config, "max_position_embeddings", 1024))
 
-        # Precomputed stores (CPU numpy → converted on demand)
-        self._pre_tok: Dict[str, np.ndarray] = {}
-        self._pre_attn: Optional[Dict[str, np.ndarray]] = None
-        self._pre_meta: Dict[str, Any] = {}
-        self._seq_normalize = seq_normalize
-        self._strict_model_match = strict_model_match
-        if precomputed_pkl_gz or precomputed_shards_dir:
-            self._load_precomputed(precomputed_pkl_gz, precomputed_shards_dir, esm_model_name)
-
-        # Fast attention & TF32 friendly settings (safe no-ops on CPU)
+        # Perf toggles
         try:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
@@ -120,7 +92,17 @@ class PanimmuneEmbedderPairs(nn.Module):
         except Exception:
             pass
 
-    # ---------- precompute helpers ----------
+        # --- Precompute stores (CPU numpy) ---
+        self._pre_tok: Dict[str, np.ndarray] = {}
+        self._pre_attn: Optional[Dict[str, np.ndarray]] = None
+        self._pre_meta: Dict[str, Any] = {}
+        self._strict_model_match = strict_model_match
+        self._seq_normalize = seq_normalize
+
+        if precomputed_pkl_gz or precomputed_shards_dir:
+            self._load_precomputed(precomputed_pkl_gz, precomputed_shards_dir, esm_model_name)
+
+    # =================== Precompute helpers =================== #
     def _norm_key(self, s: str) -> str:
         if not isinstance(s, str):
             return ""
@@ -135,352 +117,407 @@ class PanimmuneEmbedderPairs(nn.Module):
         m = meta.get("esm_model", None)
         return str(m) == str(current_model)
 
+    @staticmethod
+    def _load_pickle_gz(path: str) -> Any:
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+
     def _merge_payload(self, payload: Dict[str, Any]):
-        # Merge embeddings
-        emb = payload.get("embeddings", {})
+        emb = payload.get("embeddings", {}) or {}
         for k, v in emb.items():
-            self._pre_tok[self._norm_key(k)] = v  # numpy arrays kept on CPU
-        # Merge attentions (optional)
+            self._pre_tok[self._norm_key(k)] = v
         if "attentions" in payload:
             if self._pre_attn is None:
                 self._pre_attn = {}
-            for k, v in payload["attentions"].items():
+            for k, v in (payload["attentions"] or {}).items():
                 self._pre_attn[self._norm_key(k)] = v
-        # Keep last meta
-        self._pre_meta = payload.get("meta", {}) or self._pre_meta
+        if payload.get("meta"):
+            self._pre_meta = payload["meta"]
 
     def _load_precomputed(self, pkl_path: Optional[str], shards_dir: Optional[str], current_model: str):
         try:
             if shards_dir:
                 shard_files = sorted(glob(os.path.join(shards_dir, "shard_*.pkl.gz")))
                 for sp in shard_files:
-                    part = _load_pickle_gz(sp)
-                    # If strict, skip incompatible shards
-                    meta = part.get("meta", {})
-                    if not self._verify_meta(meta, current_model):
-                        continue
-                    self._merge_payload(part)
+                    part = self._load_pickle_gz(sp)
+                    if self._verify_meta(part.get("meta", {}), current_model):
+                        self._merge_payload(part)
             if pkl_path and os.path.isfile(pkl_path):
-                part = _load_pickle_gz(pkl_path)
-                meta = part.get("meta", {})
-                if self._verify_meta(meta, current_model):
+                part = self._load_pickle_gz(pkl_path)
+                if self._verify_meta(part.get("meta", {}), current_model):
                     self._merge_payload(part)
-
-            # Sanity: verify hidden sizes if present
+            # Hidden size sanity
             hs_file = self._pre_meta.get("hidden_size", None)
             if hs_file is not None and int(hs_file) != int(self.esm.config.hidden_size):
-                # If hidden size mismatches, we cannot reuse token embeddings safely
-                # Keep attentions if they exist (we can still project those), but drop tokens
+                # Token embeddings incompatible; keep attentions if any
                 self._pre_tok.clear()
-
         except Exception as e:
             print(f"[precompute] failed to load: {e}. Ignoring precomputed data.")
             self._pre_tok.clear()
             self._pre_attn = None
             self._pre_meta = {}
 
-    # ---------- encoding helpers ----------
-    def _encode_group_batched(
-        self,
-        seqs_in: List[str],
-        device: torch.device,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    # =================== Core utilities =================== #
+    def _project_heads_chunked(self, A_llh: torch.Tensor, out_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """
-        Encode a list of sequences that belong to the same position/group across the batch.
-        Returns:
-          tokens_list: list of [Li, C_s] tensors
-          atts_list:   list of [Li, Li, C_z] tensors
-        Uses precomputed values when available, then cache, then ESM.
+        A_llh: [L, L, H]  =>  z: [L, L, Cz] via chunked linear projection.
         """
-        # Filter out empties early
-        seqs = [(i, s) for i, s in enumerate(seqs_in) if isinstance(s, str) and len(s) > 0]
-        if not seqs:
-            return [], []
+        L, _, H = A_llh.shape
+        if L == 0:
+            return A_llh.new_zeros((0, 0, self.project_z.out_features), dtype=out_dtype or A_llh.dtype)
 
-        # First pass: try precomputed
-        tokens_list: List[torch.Tensor] = [None] * len(seqs)  # type: ignore
-        atts_list: List[torch.Tensor] = [None] * len(seqs)    # type: ignore
-        need_encode_idx: List[int] = []
-        need_encode_strs: List[str] = []
+        out_dtype = out_dtype or (self.esm.dtype if hasattr(self.esm, "dtype") else torch.float32)
+        N = L * L
+        z = A_llh.new_zeros((N, self.project_z.out_features), dtype=out_dtype)
 
-        H_current = int(self.esm.config.num_attention_heads)
-        C_s_current = int(self.esm.config.hidden_size)
-        for pos, s in seqs:
-            key = self._norm_key(s)
-            took = False
-            # 1) exact precomputed tensors (embeddings + attentions)
-            if key and key in self._pre_tok:
-                tok_np = self._pre_tok[key]  # [L, C_s_pre]
-                if tok_np.ndim == 2 and tok_np.shape[1] == C_s_current:
-                    # tokens OK
-                    t = torch.from_numpy(tok_np).to(device=device, dtype=self.esm.dtype if hasattr(self.esm, "dtype") and self.esm.dtype.is_floating_point else torch.float32)
-                    # attentions
-                    if self._pre_attn is not None and key in self._pre_attn:
-                        A_np = self._pre_attn[key]
-                        if A_np.ndim == 2:
-                            # [L, L] (last_mean) -> expand to [L, L, H_current]
-                            A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32).unsqueeze(-1).repeat(1, 1, H_current)
-                        elif A_np.ndim == 3:
-                            # Could be [H, L, L] or [L, L, H]
-                            if A_np.shape[0] == H_current:
-                                # [H, L, L] -> [L, L, H]
-                                A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32).permute(1, 2, 0).contiguous()
-                            elif A_np.shape[-1] == H_current:
-                                # already [L, L, H]
-                                A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32)
-                            else:
-                                # head mismatch; fallback to mean across any head axis
-                                A = torch.from_numpy(A_np).to(device=device, dtype=torch.float32)
-                                if A.shape[0] == A.shape[1]:
-                                    # ambiguous; treat as [L, L] by averaging over dim0 if needed
-                                    A = A.mean(dim=0, keepdim=False)
-                                    A = A.unsqueeze(-1).repeat(1, 1, H_current)
-                                else:
-                                    # assume [H?, L, L]
-                                    A = A.mean(dim=0).permute(1, 2, 0)
-                        else:
-                            # Unknown shape: make zeros to keep batch moving
-                            L = t.shape[0]
-                            A = torch.zeros((L, L, H_current), device=device, dtype=torch.float32)
-                    else:
-                        # No precomputed attention; fabricate simple diagonal (neutral) to project
-                        L = t.shape[0]
-                        A = torch.zeros((L, L, H_current), device=device, dtype=torch.float32)
+        proj = self.project_z
+        if A_llh.dtype in (torch.float16, torch.bfloat16) and proj.weight.dtype != A_llh.dtype:
+            W = proj.weight.to(dtype=A_llh.dtype)
+            b = proj.bias.to(dtype=A_llh.dtype) if proj.bias is not None else None
+            tmp_wb = (W, b)
+        else:
+            tmp_wb = None
 
-                    z = self.project_z(A)  # [L, L, C_z]
-
-                    tokens_list[pos] = t
-                    atts_list[pos] = z
-                    took = True
-            if not took:
-                # 2) cache (CPU) check
-                if self.enable_cache:
-                    got = self._cache.get(s)
-                    if got is not None:
-                        h_i, z_i = got
-                        tokens_list[pos] = h_i.to(device, non_blocking=True)
-                        atts_list[pos] = z_i.to(device, non_blocking=True)
-                        continue
-
-                # 3) mark for live ESM encode
-                need_encode_idx.append(pos)
-                need_encode_strs.append(s)
-
-        # Live ESM for those still missing
-        if len(need_encode_strs) > 0:
-            raise
-            tok = self.tokenizer(
-                need_encode_strs,
-                return_tensors="pt",
-                add_special_tokens=True,
-                padding=True,
-                truncation=False,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
-            )
-            tok = {k: v.to(device, non_blocking=True) for k, v in tok.items()}
-
-            # AMP around ESM if enabled (CUDA)
-            if self.use_amp and device.type == "cuda":
-                amp_ctx = torch.autocast(device_type="cuda", dtype=self.esm.dtype if getattr(self.esm, "dtype", torch.float32).is_floating_point else torch.bfloat16)
+        start = 0
+        flat = A_llh.view(N, H)
+        step = self.proj_chunk_elems
+        while start < N:
+            end = min(N, start + step)
+            tile = flat[start:end]
+            if tmp_wb is None:
+                out = torch.nn.functional.linear(tile, proj.weight, proj.bias)
             else:
-                class _NoOp:
-                    def __enter__(self): return None
-                    def __exit__(self, *args): return False
-                amp_ctx = _NoOp()
+                W, b = tmp_wb
+                out = torch.nn.functional.linear(tile, W, b)
+            if out.dtype != out_dtype:
+                out = out.to(out_dtype)
+            z[start:end] = out
+            del tile, out
+            start = end
+            if A_llh.is_cuda:
+                torch.cuda.empty_cache()
+        return z.view(L, L, self.project_z.out_features)
 
+    def _concat_with_seps(self, seqs: List[str]) -> Tuple[str, List[Tuple[int, int]], List[int]]:
+        parts, offsets, sep_positions = [], []
+        cur = 0
+        for i, s in enumerate(seqs):
+            if not s:
+                continue
+            parts.append(s)
+            st, en = cur, cur + len(s)
+            offsets.append((st, en))
+            cur = en
+            if i != len(seqs) - 1:
+                parts.append("X")
+                sep_positions.append(cur)
+                cur += 1
+        return "".join(parts), offsets, sep_positions
+
+    # =================== ESM encoding (single window) =================== #
+    def _esm_encode_once(self, cat: str, device: torch.device):
+        tok = self.tokenizer(
+            cat, return_tensors="pt", add_special_tokens=True,
+            padding=False, truncation=False, max_length=self.max_pos
+        )
+        tok = {k: v.to(device, non_blocking=True) for k, v in tok.items()}
+
+        amp_ok = (self.use_amp and device.type == "cuda")
+        amp_ctx = (torch.autocast(device_type="cuda", dtype=(self.esm.dtype if amp_ok else torch.float32))
+                   if amp_ok else torch.no_grad())
+        use_inference = not any(p.requires_grad for p in self.esm.parameters())
+        ctx = torch.inference_mode if use_inference else torch.no_grad
+
+        with ctx():
             with amp_ctx:
-                out = self.esm(**tok)  # last_hidden_state [B, S, C_s]; attentions: list(L)[B, H, S, S]
+                out = self.esm(**tok)
 
-            hidden = out.last_hidden_state          # [B, S, C_s]
-            attn_mask = tok["attention_mask"]       # [B, S]
-            S_vec = attn_mask.sum(dim=1)            # [B] (includes specials)
+        hidden = out.last_hidden_state[0]        # [S, C]
+        S = int(tok["attention_mask"].sum().item())
+        h = hidden[1:S - 1]                      # [L, C]
+        if self.attn_from_last_layer_only:
+            attn = out.attentions[-1][0]         # [H, S, S]
+        else:
+            attn = torch.stack(out.attentions, dim=0).mean(dim=0)[0]
+        A_last = attn[:, 1:S - 1, 1:S - 1]       # [H, L, L]
+        return h, A_last
 
-            # Select attentions (last layer or mean over layers)
-            if self.attn_from_last_layer_only:
-                attn_all = out.attentions[-1]       # [B, H, S, S]
-            else:
-                attn_all = torch.stack(out.attentions, dim=0).mean(dim=0)  # [B, H, S, S]
-
-            for j in range(hidden.size(0)):
-                S_j = int(S_vec[j].item())
-                if S_j <= 2:
-                    c_s = hidden.shape[-1]
-                    c_z = self.project_z.out_features
-                    h_j = hidden.new_zeros((0, c_s))
-                    z_j = hidden.new_zeros((0, 0, c_z))
-                else:
-                    # strip BOS/EOS
-                    h_j = hidden[j, 1:S_j-1, :]                         # [L, C_s]
-                    a_j = attn_all[j, :, 1:S_j-1, 1:S_j-1]              # [H, L, L]
-                    a_j = a_j.permute(1, 2, 0).contiguous()             # [L, L, H]
-                    z_j = self.project_z(a_j)                           # [L, L, C_z]
-
-                pos = need_encode_idx[j]
-                tokens_list[pos] = h_j
-                atts_list[pos] = z_j
-
-                # Offload to CPU cache
-                if self.enable_cache:
-                    self._cache.put(need_encode_strs[j], (h_j.detach().cpu(), z_j.detach().cpu()))
-
-        # Compact (remove Nones) preserving the original order of non-empty seqs
-        final_tokens, final_atts = [], []
-        for (pos, _s) in seqs:
-            final_tokens.append(tokens_list[pos])
-            final_atts.append(atts_list[pos])
-
-        return final_tokens, final_atts
-
-    # ---------- main forward ----------
-    def forward(
-        self,
-        batch_pairs: List[List[str]],               # e.g., [["heavy","light","antigen"], ["heavy","antigen"], ...]
-        return_metadata: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, Any]]:
+    # =================== Chunk & stitch (cat coord) =================== #
+    def _encode_chunked_cat(
+        self, cat: str, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Chunk-and-stitch embeddings + attentions in *cat* coordinates.
         Returns:
-            s: [B, Lmax, C_s] (padded)
-            z: [B, Lmax, Lmax, C_z] (padded)
-            (single_mask, pair_mask):
-                single_mask: [B, Lmax] (True = valid token)
-                pair_mask:   [B, Lmax, Lmax] (True = valid pair)
-            meta: { "offsets_per_sample": List[List[(st,en)]], "lengths": List[int], "Lmax": int }
+          h_full: [L_cat, C_s]
+          A_full: [H, L_cat, L_cat]  (assembled by window overlap-averaging on blocks)
+        """
+        C_s = self.esm.config.hidden_size
+        L_cat = len(cat)
+        H = int(self.esm.config.num_attention_heads)
+
+        # Embedding accumulators
+        h_sum = torch.zeros((L_cat, C_s), device=device, dtype=self.esm.dtype if hasattr(self.esm, "dtype") else torch.float32)
+        h_cnt = torch.zeros((L_cat,), device=device, dtype=torch.float32)
+
+        # Attention accumulator (diagonal tiles only; we build full A as needed)
+        # For simplicity, we accumulate a dense A; windows are bounded so memory is acceptable per step.
+        A_sum = torch.zeros((H, L_cat, L_cat), device=device, dtype=torch.float32)
+        A_cnt = torch.zeros((L_cat, L_cat), device=device, dtype=torch.float32)
+
+        W, S = self.window, self.stride
+        starts = list(range(0, max(1, L_cat - 1), S))
+        if not starts or starts[-1] + W < L_cat:
+            starts.append(max(0, L_cat - W))
+
+        for g_st in starts:
+            g_en = min(L_cat, g_st + W)
+            sub = cat[g_st:g_en]
+            h_win, A_last = self._esm_encode_once(sub, device=device)  # h_win: [l,C], A_last: [H,l,l]
+            l = h_win.size(0)
+
+            # embeddings
+            h_sum[g_st:g_st + l] += h_win
+            h_cnt[g_st:g_st + l] += 1.0
+
+            # attentions
+            A_sum[:, g_st:g_st + l, g_st:g_st + l] += A_last
+            A_cnt[g_st:g_st + l, g_st:g_st + l] += 1.0
+
+            del h_win, A_last
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        h_cnt = torch.clamp(h_cnt, min=1.0)
+        h_full = h_sum / h_cnt.unsqueeze(1)
+
+        A_cnt = torch.clamp(A_cnt, min=1.0)
+        A_full = A_sum / A_cnt.unsqueeze(0)
+
+        return h_full, A_full  # [L,C], [H,L,L]
+
+    # =================== Precompute retrieval =================== #
+    def _get_pre_tokens(self, seq: str, device: torch.device) -> Optional[torch.Tensor]:
+        key = self._norm_key(seq)
+        if key and key in self._pre_tok:
+            tok_np = self._pre_tok[key]
+            if tok_np.ndim == 2 and tok_np.shape[1] == self.esm.config.hidden_size:
+                return torch.from_numpy(tok_np).to(device=device, dtype=self.esm.dtype if hasattr(self.esm, "dtype") else torch.float32)
+        return None
+
+    def _get_pre_attn(self, seq: str, L_expect: int, device: torch.device) -> Optional[torch.Tensor]:
+        if self._pre_attn is None:
+            return None
+        key = self._norm_key(seq)
+        if not key or key not in self._pre_attn:
+            return None
+        A = self._pre_attn[key]
+        # Accept [L,L], [H,L,L], or [L,L,H]; coerce to [H,L,L]
+        if A.ndim == 2:
+            A = np.repeat(A[..., None], self.esm.config.num_attention_heads, axis=2)  # [L,L,H]
+        if A.ndim == 3 and A.shape[0] == self.esm.config.num_attention_heads:
+            A_t = torch.from_numpy(A).to(device=device, dtype=torch.float32)          # [H,L,L]
+        elif A.ndim == 3 and A.shape[-1] == self.esm.config.num_attention_heads:
+            A_t = torch.from_numpy(A).to(device=device, dtype=torch.float32).permute(2, 0, 1).contiguous()
+        else:
+            return None
+        if A_t.shape[-1] != L_expect or A_t.shape[-2] != L_expect:
+            return None
+        return A_t
+
+    # =================== Forward =================== #
+    def forward(self, batch_pairs: List[List[str]], return_metadata: bool = True):
+        """
+        Per sample:
+          • Try precompute (full concatenated key, else per-chain).
+          • Else encode: single-pass if len<=max_pos; else chunk-and-stitch (cat coord).
+          • Build block-diagonal z via chunked projection (per chain).
+          • Pairformer per sample; no pre-padding.
         """
         device = self._device_anchor.device
-        B = len(batch_pairs)
-        if B == 0:
-            c_s = self.esm.config.hidden_size
-            c_z = self.project_z.out_features
-            empty = (
-                torch.zeros((0, 0, c_s), device=device),
-                torch.zeros((0, 0, 0, c_z), device=device),
-                (torch.zeros((0, 0), dtype=torch.bool, device=device), torch.zeros((0, 0, 0), dtype=torch.bool, device=device)),
-                {"offsets_per_sample": [], "lengths": [], "Lmax": 0},
-            )
-            return empty
+        dt = (self.esm.dtype if hasattr(self.esm, "dtype") else torch.float32)
+        z_dtype = (torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported()
+                   else torch.float16 if device.type == "cuda" else dt)
 
-        # Determine max K across samples; keep alignment with placeholders (empty string) if needed
-        K = max(len(s) for s in batch_pairs)
-        grouped: List[List[str]] = [[] for _ in range(K)]
+        s_out_list, z_out_list = [], []
+        sm_list, pm_list = [], []
+        meta_offsets, meta_lengths = [], []
+
         for sample in batch_pairs:
-            for k in range(K):
-                grouped[k].append(sample[k] if k < len(sample) else "")
-
-        # Encode each group batched
-        group_tokens: List[List[torch.Tensor]] = []
-        group_atts: List[List[torch.Tensor]] = []
-        for k in range(K):
-            non_empty = [s for s in grouped[k] if isinstance(s, str) and len(s) > 0]
-            if len(non_empty) == 0:
-                group_tokens.append([])
-                group_atts.append([])
-                continue
-            t_k, z_k = self._encode_group_batched(non_empty, device=device)
-            group_tokens.append(t_k)  # list of per-seq [L, C_s]
-            group_atts.append(z_k)    # list of per-seq [L, L, C_z]
-
-        # Rebuild each sample by concatenating its groups in order
-        s_list, z_list, single_masks, pair_masks = [], [], [], []
-        offsets_per_sample, lengths = [], []
-        g_ptrs = [0] * K  # pointers within each encoded group list
-
-        inferred_dtype: Optional[torch.dtype] = None
-
-        for b in range(B):
-            s_blocks, z_blocks, offsets = [], [], []
-            total = 0
-            for k in range(K):
-                if k >= len(batch_pairs[b]) or not isinstance(batch_pairs[b][k], str) or len(batch_pairs[b][k]) == 0:
-                    continue
-                if g_ptrs[k] >= len(group_tokens[k]):
-                    continue
-                s_k = group_tokens[k][g_ptrs[k]]   # [Lk, C_s]
-                z_k = group_atts[k][g_ptrs[k]]     # [Lk, Lk, C_z]
-                g_ptrs[k] += 1
-
-                if inferred_dtype is None:
-                    inferred_dtype = s_k.dtype
-
-                Lk = s_k.shape[0]
-                if Lk == 0:
-                    continue
-                s_blocks.append(s_k)
-                z_blocks.append(z_k)
-                offsets.append((total, total + Lk))
-                total += Lk
-
-            if total == 0:
-                c_s = self.esm.config.hidden_size
-                c_z = self.project_z.out_features
-                dt = inferred_dtype or torch.float32
-                s_list.append(torch.zeros((0, c_s), device=device, dtype=dt))
-                z_list.append(torch.zeros((0, 0, c_z), device=device, dtype=dt))
-                single_masks.append(torch.zeros((0,), dtype=torch.bool, device=device))
-                pair_masks.append(torch.zeros((0, 0), dtype=torch.bool, device=device))
-                offsets_per_sample.append([])
-                lengths.append(0)
+            seqs = [s for s in sample if isinstance(s, str) and len(s) > 0]
+            if not seqs:
                 continue
 
-            s_i = torch.cat(s_blocks, dim=0)  # [Li, C_s]
-            c_z = z_blocks[0].shape[-1]
-            z_i = s_i.new_zeros((total, total, c_z))
-            pair_mask_i = torch.zeros((total, total), dtype=torch.bool, device=device)
+            # Build concatenated string and offsets (cat coordinates)
+            cat, chain_offsets_cat, _ = self._concat_with_seps(seqs)
+            L_cat = len(cat)
 
-            for z_blk, (st, en) in zip(z_blocks, offsets):
-                z_i[st:en, st:en, :] = z_blk
-                pair_mask_i[st:en, st:en] = True
+            # ---------- 1) Try precompute: full concatenated ----------
+            pre_h_cat = self._get_pre_tokens(cat, device=device)
+            pre_A_cat = self._get_pre_attn(cat, L_expect=L_cat, device=device) if pre_h_cat is not None else None
 
+            if pre_h_cat is not None and pre_A_cat is not None:
+                # Slice per-chain directly
+                chain_h = [pre_h_cat[st:en] for (st, en) in chain_offsets_cat]
+                z_blocks = []
+                A_llh = pre_A_cat.permute(1, 2, 0).contiguous()  # [L,L,H]
+                A_llh = A_llh.to(dtype=(torch.bfloat16 if A_llh.is_cuda and torch.cuda.is_bf16_supported()
+                                        else torch.float16 if A_llh.is_cuda else torch.float32))
+                for (st, en) in chain_offsets_cat:
+                    l = en - st
+                    z_blk = self._project_heads_chunked(A_llh[st:en, st:en, :], out_dtype=z_dtype) if l > 0 else pre_h_cat.new_zeros((0, 0, self.project_z.out_features), dtype=z_dtype)
+                    z_blocks.append(z_blk)
+                del pre_A_cat, A_llh
+                h_full = pre_h_cat  # keep for consistency (not strictly needed beyond chain slices)
+
+            else:
+                # ---------- 2) Try precompute: all chains individually ----------
+                pre_ok_all = True
+                chain_h, pre_A_chain = [], []
+                for s in seqs:
+                    h_s = self._get_pre_tokens(s, device=device)
+                    if h_s is None:
+                        pre_ok_all = False
+                        chain_h.append(None)      # placeholder
+                        pre_A_chain.append(None)
+                        continue
+                    A_s = self._get_pre_attn(s, L_expect=h_s.shape[0], device=device)
+                    if A_s is None:
+                        pre_ok_all = False
+                        chain_h.append(None)
+                        pre_A_chain.append(None)
+                        continue
+                    chain_h.append(h_s)
+                    pre_A_chain.append(A_s)
+
+                if pre_ok_all:
+                    # All chains precomputed; assemble
+                    z_blocks = []
+                    for h_s, A_s in zip(chain_h, pre_A_chain):
+                        if h_s is None or A_s is None:
+                            z_blocks.append(torch.zeros((0, 0, self.project_z.out_features), device=device, dtype=z_dtype))
+                            continue
+                        A_llh = A_s.permute(1, 2, 0).contiguous().to(
+                            dtype=(torch.bfloat16 if A_s.is_cuda and torch.cuda.is_bf16_supported()
+                                   else torch.float16 if A_s.is_cuda else torch.float32)
+                        )  # [L,L,H]
+                        z_blk = self._project_heads_chunked(A_llh, out_dtype=z_dtype)
+                        z_blocks.append(z_blk)
+                    # concat chain_h into cat order (no 'X' indices in this assembled space)
+                    h_full = torch.cat(chain_h, dim=0)
+
+                else:
+                    # ---------- 3) Encode missing (cat path) ----------
+                    if L_cat <= self.max_pos:
+                        # single pass
+                        h_full, A_full = self._esm_encode_once(cat, device=device)  # [L,C], [H,L,L]
+                    else:
+                        # chunk-and-stitch for both h and A in cat coords
+                        h_full, A_full = self._encode_chunked_cat(cat, device=device)  # [L,C], [H,L,L]
+
+                    # Build per-chain blocks from cat A
+                    z_blocks = []
+                    A_llh = A_full.permute(1, 2, 0).contiguous().to(
+                        dtype=(torch.bfloat16 if A_full.is_cuda and torch.cuda.is_bf16_supported()
+                               else torch.float16 if A_full.is_cuda else torch.float32)
+                    )  # [L,L,H]
+                    for (st, en) in chain_offsets_cat:
+                        l = en - st
+                        if l <= 0:
+                            z_blocks.append(h_full.new_zeros((0, 0, self.project_z.out_features), dtype=z_dtype))
+                            continue
+                        z_blk = self._project_heads_chunked(A_llh[st:en, st:en, :], out_dtype=z_dtype)
+                        z_blocks.append(z_blk)
+                    del A_full, A_llh
+
+            # ---------- Assemble s_i, z_i (block-diagonal), masks ----------
+            chain_h_slices = [h_full[st:en] for (st, en) in chain_offsets_cat]
+            total_L = sum(h.shape[0] for h in chain_h_slices)
+            s_i = torch.cat(chain_h_slices, dim=0) if total_L > 0 else h_full.new_zeros((0, self.esm.config.hidden_size))
+            z_i = s_i.new_zeros((total_L, total_L, self.project_z.out_features), dtype=z_dtype)
+
+            offsets_assembled = []
+            cur = 0
+            for (st, en), z_blk in zip(chain_offsets_cat, z_blocks):
+                l = en - st
+                if l > 0:
+                    z_i[cur:cur + l, cur:cur + l, :] = z_blk
+                    offsets_assembled.append((cur, cur + l))
+                    cur += l
+                else:
+                    offsets_assembled.append((cur, cur))
+
+            single_mask = torch.ones((1, total_L), dtype=torch.bool, device=device)
+            pair_mask = torch.zeros((1, total_L, total_L), dtype=torch.bool, device=device)
+            for (st, en) in offsets_assembled:
+                if en > st:
+                    pair_mask[:, st:en, st:en] = True
             if self.allow_inter_chain:
-                pair_mask_i[:, :] = True
+                pair_mask[:] = True  # off-diagonals in z are zero in this module
 
-            s_list.append(s_i)
-            z_list.append(z_i)
-            single_masks.append(torch.ones((total,), dtype=torch.bool, device=device))
-            pair_masks.append(pair_mask_i)
-            offsets_per_sample.append(offsets)
-            lengths.append(total)
+            # ---------- Pairformer per sample ----------
+            s_b = s_i.unsqueeze(0).to(dtype=dt)
+            z_b = z_i.unsqueeze(0)
+            s_b_out, z_b_out = self.pairformer(s=s_b, z=z_b, single_mask=single_mask, pair_mask=pair_mask)
 
-        # Pad across batch to Lmax
-        Lmax = max(lengths) if lengths else 0
-        c_s = self.esm.config.hidden_size
-        c_z = self.project_z.out_features
-        dt = inferred_dtype or (self.esm.dtype if hasattr(self.esm, "dtype") else torch.float32)
+            s_out_list.append(s_b_out)
+            z_out_list.append(z_b_out)
+            sm_list.append(single_mask)
+            pm_list.append(pair_mask)
+            meta_offsets.append(offsets_assembled)
+            meta_lengths.append(total_L)
 
-        s = torch.zeros((B, Lmax, c_s), device=device, dtype=dt)
-        z = torch.zeros((B, Lmax, Lmax, c_z), device=device, dtype=dt)
-        single_mask = torch.zeros((B, Lmax), dtype=torch.bool, device=device)
-        pair_mask = torch.zeros((B, Lmax, Lmax), dtype=torch.bool, device=device)
-
-        for b in range(B):
-            L = lengths[b]
-            if L == 0:
-                continue
-            s[b, :L] = s_list[b]
-            z[b, :L, :L] = z_list[b]
-            single_mask[b, :L] = True
-            pair_mask[b, :L, :L] = pair_masks[b]
-
-        # Pairformer pass
-        s_out, z_out = self.pairformer(
-            s=s,
-            z=z,
-            single_mask=single_mask,
-            pair_mask=pair_mask,
-        )
+            # free temps
+            del s_i, z_i, chain_h_slices, z_blocks, h_full
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
         meta = {
-            "offsets_per_sample": offsets_per_sample,
-            "lengths": lengths,
-            "Lmax": Lmax,
-            "precompute_used": (len(self._pre_tok) > 0),
+            "offsets_per_sample": meta_offsets,
+            "lengths": meta_lengths,
+            "Lmax": max(meta_lengths) if meta_lengths else 0,
+            "chunking": {"window": self.window, "stride": self.stride},
+            "precompute_used": (len(self._pre_tok) > 0) or (self._pre_attn is not None),
             "precompute_model": self._pre_meta.get("esm_model", None),
             "precompute_attn_kind": self._pre_meta.get("attn_kind", None),
         }
-        return s_out, z_out, (single_mask, pair_mask), meta
+
+        if not self.return_padded:
+            return s_out_list, z_out_list, (sm_list, pm_list), meta
+
+        # Optional: pad AFTER Pairformer
+        if len(s_out_list) == 0:
+            cs = self.esm.config.hidden_size
+            cz = self.project_z.out_features
+            device = self._device_anchor.device
+            empty_s = torch.zeros((0, 0, cs), device=device)
+            empty_z = torch.zeros((0, 0, 0, cz), device=device)
+            empty_sm = torch.zeros((0, 0), dtype=torch.bool, device=device)
+            empty_pm = torch.zeros((0, 0, 0), dtype=torch.bool, device=device)
+            return empty_s, empty_z, (empty_sm, empty_pm), meta
+
+        Ls = [x.shape[1] for x in s_out_list]
+        Lmax = max(Ls)
+        B = len(s_out_list)
+        device = s_out_list[0].device
+        cs = s_out_list[0].shape[-1]
+        cz = z_out_list[0].shape[-1]
+
+        s_pad = torch.zeros((B, Lmax, cs), device=device, dtype=s_out_list[0].dtype)
+        z_pad = torch.zeros((B, Lmax, Lmax, cz), device=device, dtype=z_out_list[0].dtype)
+        sm_pad = torch.zeros((B, Lmax), dtype=torch.bool, device=device)
+        pm_pad = torch.zeros((B, Lmax, Lmax), dtype=torch.bool, device=device)
+        for b in range(B):
+            L = Ls[b]
+            s_pad[b, :L] = s_out_list[b][0]
+            z_pad[b, :L, :L] = z_out_list[b][0]
+            sm_pad[b, :L] = sm_list[b][0]
+            pm_pad[b, :L, :L] = pm_list[b][0]
+        return s_pad, z_pad, (sm_pad, pm_pad), meta
 
 
-# ------------------------------- quick test ------------------------------- #
+# --------------------------- quick test --------------------------- #
 if __name__ == "__main__":
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
@@ -491,17 +528,26 @@ if __name__ == "__main__":
         allow_inter_chain=False,
         attn_from_last_layer_only=True,
         torch_dtype=dtype,
-        max_length=None,                  # defaults to ESM pos-emb
-        pad_to_multiple_of=8,
-        enable_cache=True,
-        cache_size=200_000,
-        freeze_esm=True,                  # no grads for ESM
+        freeze_esm=True,
         use_amp=True,
-        # point these at your precompute:
-        precomputed_pkl_gz=r"esm2_token_embeddings_650M_long.pkl.gz",
-        precomputed_shards_dir=None,  # or None
+        pairformer_blocks=4,
+        pair_c=32,
+        window=1000,
+        stride=900,
+        # point these at your precompute if available:
+        precomputed_pkl_gz=None,         # e.g., "esm2_precompute.pkl.gz"
+        precomputed_shards_dir=None,     # e.g., "esm_shards"
         strict_model_match=True,
         seq_normalize=False,
     ).to(device)
-    print(model._encode_group_batched(["HLMGWDYPK", "MAVMPPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGRGEPRFIAVGYVDDTQFVRFDSDAASQRMEPRAPWIEQEGPEYWDQETRSAKAHSQTDRVDLGTLRGYYNQSEDGSHTIQIMYGCDVGSDGRFLRGYRQDAYDGKDYIALNEDLRSWTAADMAAQITKRKWEAAHAAEQQRAYLEGTCVEWLRRYLENGKETLQRTDPPKTHMTHHPISDHEATLRCWALGFYPAEITLTWQRDGEDQTQDTELVETRPAGDGTFQKWAAVVVPSGEEQRYTCHVQHEGLPKPLTLRWEPSSQPTIPIVGIIAGLVLLGAVITGAVVAAVMWRRKSSDRKGGSYTQAASSDSAQGSDVSLTACKV"], device=device))
 
+    long_antigen = "M" * 1800 + "K" * 400  # 2200 aa
+    batch_pairs = [
+        ["QVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSW", "LTQPPSVSVAPGKTARITCGGNNIGSKSVHWYQQKSGTSPKRWI"],
+        ["QVQLVQSGAEVKKPGSSVKVSCKASGYTFTNYW", long_antigen],
+    ]
+
+    s_out, z_out, masks, meta = model(batch_pairs, return_metadata=True)
+    print(f"#samples={len(s_out)}")
+    for i, (s_i, z_i) in enumerate(zip(s_out, z_out)):
+        print(f"  sample {i}: s {tuple(s_i.shape)}  z {tuple(z_i.shape)}  L={meta['lengths'][i]}  blocks={len(meta['offsets_per_sample'][i])}")
