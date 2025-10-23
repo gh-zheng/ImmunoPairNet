@@ -1,7 +1,9 @@
-# train_classifier.py — DDP trainer supporting CUDA & XPU, AMP, grad clipping, rank-0 I/O, and cache freeing
-import os, random, json, time
+# train_classifier.py — DDP trainer with CUDA & XPU, AMP, grad clipping, rank-0 I/O,
+# full checkpoint save/resume, split-file resume fallback, and cache freeing.
+
+import os, random, json, time, gc
 from datetime import timedelta
-from typing import Tuple, Any, Dict
+from typing import Tuple, Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -9,20 +11,18 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
-import gc
-# ---- model & config (your files) ----
 
+# ---- model & config (your files) ----
 from classification import load_default_config, build_embedder, build_classifier, PairAwareClassifier
 
-
 # ---- datasets (your files) ----
-from Panimmnue_dataload import (
+from Panimmnue_dataload import (  # keep your module name as-is
     IEDBRetrainMHCDataset, collate_mhc_panimmune,
     IntegratedTCRDataset,   collate_tcr_panimmune,
     IntegratedAntibodyDataset, collate_antibody_panimmune,
 )
 
-
+# ============================= Memory helpers ============================= #
 def free_device_memory():
     """
     Safely clear Python refs + GPU/XPU caches.
@@ -63,7 +63,8 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-EPOCHS = 10
+# Train up to this (final) epoch number.
+EPOCHS = 10                    # <-- if resuming from 10, set this to your new target (e.g., 20)
 BATCH_SIZE = 1
 BASE_LR = 3e-4
 WEIGHT_DECAY = 0.01
@@ -74,12 +75,12 @@ PERSISTENT_WORKERS = True
 SEED = 42
 
 DO_SMOKE_TEST = False
-LOCAL_TEST_100 = True
+LOCAL_TEST_100 = True          # keeps first 10 samples per dataset to sanity-check quickly
 
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
 CONFIG_OUT = os.path.join(SAVE_DIR, "config.json")
-SAVE_EVERY = 1
+SAVE_EVERY = 1                 # save every N epochs (full checkpoint)
 
 # ============================= Utilities ============================= #
 def set_seed(seed: int = 42):
@@ -114,7 +115,6 @@ def free_device_cache(device: torch.device):
         except Exception:
             pass
     else:
-        import gc
         gc.collect()
 
 # AMP helpers that gracefully degrade if a backend lacks AMP classes
@@ -131,7 +131,6 @@ def amp_autocast(device: torch.device):
         return torch.cuda.amp.autocast()
     if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
         return torch.xpu.amp.autocast()  # Intel extension
-    # no-op context manager
     from contextlib import nullcontext
     return nullcontext()
 
@@ -142,7 +141,6 @@ def amp_scaler(device: torch.device, enabled: bool):
     if device.type == "cuda":
         return torch.cuda.amp.GradScaler(enabled=True)
     if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
-        # Intel extension provides its own GradScaler
         return torch.xpu.amp.GradScaler(enabled=True)
     return _NullScaler()
 
@@ -160,8 +158,7 @@ def init_distributed():
             backend = "nccl"
             torch.cuda.set_device(local_rank)
         elif device.type == "xpu":
-            # Prefer 'ccl' when oneCCL is installed; allow override via env
-            backend = os.environ.get("TORCH_DDP_BACKEND", "ccl")
+            backend = os.environ.get("TORCH_DDP_BACKEND", "ccl")  # prefer oneCCL if present
             try:
                 if hasattr(torch, "xpu"):
                     torch.xpu.set_device(local_rank)
@@ -174,7 +171,6 @@ def init_distributed():
             dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600))
             is_ddp = True
         except Exception as e:
-            # Fallback to single-process if DDP init fails
             if global_rank == 0:
                 print(f"[DDP] Failed to init backend='{backend}': {e}. Falling back to single process.")
             is_ddp = False
@@ -231,6 +227,84 @@ def make_loader(kind: str, ds, batch_size: int, is_ddp: bool):
     )
     return dl, sampler
 
+# ============================= Checkpoint helpers ============================= #
+def _get_msave(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
+
+def save_checkpoint(model, opt, scaler, epoch, cfg, train_sets, save_dir, device):
+    os.makedirs(save_dir, exist_ok=True)
+    msave = _get_msave(model)
+    ckpt = {
+        "epoch": int(epoch),
+        "model": msave.state_dict(),
+        "optimizer": opt.state_dict(),
+        "scaler": (None if isinstance(scaler, _NullScaler) else scaler.state_dict()),
+        "cfg_embedder": cfg.embedder.__dict__,
+        "cfg_classifier": cfg.classifier.__dict__,
+        "train_sets": train_sets,
+        "rng_state": torch.get_rng_state(),
+        "backend_device": device.type,
+    }
+    if torch.cuda.is_available():
+        ckpt["cuda_rng_state"] = torch.cuda.get_rng_state()
+    torch.save(ckpt, os.path.join(save_dir, f"ckpt_epoch{epoch}.pt"))
+    print(f"[Save] Full checkpoint: {os.path.join(save_dir, f'ckpt_epoch{epoch}.pt')}")
+
+def load_checkpoint_if_any(resume_from: str, model, opt, scaler, device) -> int:
+    """
+    Returns next_epoch index to start from (last_epoch + 1).
+    Call this on ALL ranks after DDP wrapping.
+    """
+    if not resume_from:
+        return 1
+    if not os.path.exists(resume_from):
+        print(f"[Resume] Not found: {resume_from} — starting fresh.")
+        return 1
+
+    map_loc = {"cuda": f"cuda:{device.index}", "xpu": f"xpu:{device.index}"}.get(device.type, "cpu")
+    ckpt = torch.load(resume_from, map_location=map_loc)
+
+    msave = _get_msave(model)
+    msave.load_state_dict(ckpt["model"], strict=True)
+
+    if ckpt.get("optimizer") is not None:
+        try:
+            opt.load_state_dict(ckpt["optimizer"])
+        except Exception as e:
+            print(f"[Resume] Optimizer state load failed ({e}); continuing with fresh optimizer.")
+
+    if ckpt.get("scaler") and not isinstance(scaler, _NullScaler):
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+        except Exception as e:
+            print(f"[Resume] AMP scaler state load failed ({e}); continuing with fresh scaler.")
+
+    if "rng_state" in ckpt:
+        torch.set_rng_state(ckpt["rng_state"])
+    if torch.cuda.is_available() and "cuda_rng_state" in ckpt:
+        torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+
+    last_epoch = int(ckpt.get("epoch", 0))
+    print(f"[Resume] Loaded checkpoint: {resume_from} (epoch {last_epoch})")
+    return last_epoch + 1
+
+def load_split_epoch(model, embedder_path: str, head_path: str, device, strict: bool = True):
+    """
+    Fallback loader when only split weights exist (no optimizer/scaler/epoch).
+    """
+    msave = _get_msave(model)
+    if not os.path.exists(embedder_path) or not os.path.exists(head_path):
+        raise FileNotFoundError("[Resume-split] Missing embedder/head path(s).")
+
+    mp = torch.load(embedder_path, map_location=device)
+    hp = torch.load(head_path,    map_location=device)
+    msave.embedder.load_state_dict(mp["state_dict"], strict=True)
+
+    # Load “head” (everything not under embedder.)
+    head_state = hp["state_dict"]
+    missing, unexpected = msave.load_state_dict(head_state, strict=False)
+    print(f"[Resume-split] missing={missing} unexpected={unexpected}")
+
 # ============================= Training functions ============================= #
 def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, grad_clip_norm: float, use_amp: bool):
     total, correct, total_loss = 0, 0, 0.0
@@ -278,10 +352,16 @@ def smoke_test(model, dl, name, device, do_print=True):
         print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | labels={tuple(labels.shape)}")
 
 # ============================= Main training loop ============================= #
-def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
+def run_training(train_sets,
+                 epochs=EPOCHS, batch_size=BATCH_SIZE,
                  lr=BASE_LR, weight_decay=WEIGHT_DECAY, save_every=SAVE_EVERY,
-                 save_dir=SAVE_DIR, config_out=CONFIG_OUT):
-
+                 save_dir=SAVE_DIR, config_out=CONFIG_OUT,
+                 resume_from: str = "",
+                 resume_split: Optional[Tuple[str, str, int]] = None):
+    """
+    resume_from: path to full checkpoint (ckpt_epochX.pt). If provided, takes precedence.
+    resume_split: tuple (embedder_path, head_path, start_epoch) for legacy split saves.
+    """
     set_seed(SEED)
     is_ddp, world_size, global_rank, local_rank, device, backend = init_distributed()
     is_main = is_main_process(global_rank)
@@ -308,6 +388,18 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss()
+    scaler = amp_scaler(device, enabled=use_amp)
+
+    # ==== Resume logic ====
+    if resume_from:
+        start_epoch = load_checkpoint_if_any(resume_from, model, opt, scaler, device)
+    elif resume_split:
+        emb_path, head_path, start_epoch_hint = resume_split
+        load_split_epoch(model, emb_path, head_path, device, strict=True)
+        start_epoch = int(start_epoch_hint)
+        print(f"[Resume-split] Starting from epoch {start_epoch} (optimizer/scaler reset).")
+    else:
+        start_epoch = 1
 
     # ==== Build loaders ====
     loaders, samplers, sizes = {}, {}, {}
@@ -340,7 +432,7 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
     free_device_cache(device)
 
     # ==== Train loop ====
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # distinct shuffles across epochs (DDP)
         for k, sampler in samplers.items():
             if isinstance(sampler, DistributedSampler):
@@ -349,7 +441,7 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
         if is_main:
             print(f"\n=== Epoch {epoch} ===")
         per_ds_metrics = {}
-        start = time.time()
+        start_t = time.time()
 
         model.train()
         for k, dl in loaders.items():
@@ -365,17 +457,11 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
         avg_loss = sum(l for l, _ in per_ds_metrics.values()) / len(per_ds_metrics)
         avg_acc  = sum(a for _, a in per_ds_metrics.values()) / len(per_ds_metrics)
         if is_main:
-            print(f"[avg] loss={avg_loss:.4f} acc={avg_acc:.3f} time={time.time()-start:.1f}s")
+            print(f"[avg] loss={avg_loss:.4f} acc={avg_acc:.3f} time={time.time()-start_t:.1f}s")
 
         # save checkpoints (rank 0)
         if (epoch % save_every == 0) and is_main:
-            msave = model.module if isinstance(model, DDP) else model
-            emb_path = os.path.join(save_dir, f"embedder_epoch{epoch}.pt")
-            cls_path = os.path.join(save_dir, f"classification_epoch{epoch}.pt")
-            torch.save({"state_dict": msave.embedder.state_dict()}, emb_path)
-            head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embedder.")}
-            torch.save({"state_dict": head_state}, cls_path)
-            print(f"Saved: {emb_path} | {cls_path}")
+            save_checkpoint(model, opt, scaler, epoch, cfg, list(loaders.keys()), save_dir, device)
 
         # sync and free memory caches AFTER each epoch
         barrier_if_distributed(is_ddp)
@@ -386,13 +472,13 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
     free_device_cache(device)
 
     if is_main:
-        msave = model.module if isinstance(model, DDP) else model
+        msave = _get_msave(model)
         emb_path = os.path.join(save_dir, "embedder_final.pt")
         cls_path = os.path.join(save_dir, "classification_final.pt")
         torch.save({"state_dict": msave.embedder.state_dict()}, emb_path)
         head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embedder.")}
         torch.save({"state_dict": head_state}, cls_path)
-        print(f"Saved final: {emb_path} | {cls_path}")
+        print(f"[Save] Inference weights: {emb_path} | {cls_path}")
 
         # config dump
         with open(config_out, "w") as f:
@@ -406,7 +492,7 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
                     "train_sets": train_sets, "world_size": world_size, "backend": backend
                 }
             }, f, indent=2)
-        print(f"Saved config to {config_out}")
+        print(f"[Save] Config: {config_out}")
 
     if is_ddp and dist.is_initialized():
         dist.destroy_process_group()
@@ -415,5 +501,30 @@ def run_training(train_sets, epochs=EPOCHS, batch_size=BATCH_SIZE,
 if __name__ == "__main__":
     MHC_ONLY = True
     TRAIN_SETS = ["mhc", "tcr", "ab"]
-    selected_sets = ["mhc"] if MHC_ONLY else TRAIN_SETS
-    run_training(train_sets=selected_sets)
+    selected_sets = ["ab"] if MHC_ONLY else TRAIN_SETS
+
+    # --- Choose exactly one of these resume modes ---
+    # 1) Full checkpoint resume (best, restores optimizer/scaler/RNG/epoch)
+    RESUME = ""  # e.g., "model_parameter/ckpt_epoch10.pt"
+
+    # 2) Legacy split weights resume (only model weights). Tuple: (embedder_pt, classifier_pt, start_epoch)
+    RESUME_SPLIT = None
+    # Example:
+    # RESUME_SPLIT = (
+    #     "model_parameter/embedder_epoch10.pt",
+    #     "model_parameter/classification_epoch10.pt",
+    #     11
+    # )
+
+    run_training(
+        train_sets=selected_sets,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=BASE_LR,
+        weight_decay=WEIGHT_DECAY,
+        save_every=SAVE_EVERY,
+        save_dir=SAVE_DIR,
+        config_out=CONFIG_OUT,
+        resume_from=RESUME,
+        resume_split=RESUME_SPLIT
+    )

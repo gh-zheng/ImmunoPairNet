@@ -4,5 +4,6 @@ classify.py
 /data/*.csv
 /model_parameter/*
 esm2_token_embeddings_650M.pkl.gz
-esm2_token_embeddings_650M_long.pkl.gz
+MHC_esm2_token_embeddings_650M_long.pkl.gz
 esm_shards/*
+esm_antibody_antigen/*
