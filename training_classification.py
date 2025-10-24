@@ -1,9 +1,19 @@
-# train_classifier.py — DDP trainer with CUDA & XPU, AMP, grad clipping, rank-0 I/O,
-# full checkpoint save/resume, split-file resume fallback, and cache freeing.
+# train_classifier.py — BCEWithLogitsLoss trainer (float labels in [0,1])
+# - Works with your four modules:
+#     * model_config.py            -> load_default_config() returning ModelConfig(esm, pair, classifier)
+#     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, esm_cfg, pair_cfg)
+#     * PanimmuneEmbedderPairs.py  -> used internally by the classifier
+#     * Panimmune_dataload.py      -> datasets returning (concat_seq_str, label_float_in_[0,1])
+#
+# - Features:
+#     * DDP (CUDA/XPU/CPU), AMP, grad clipping
+#     * Checkpoint save/resume (full or split embedder/head)
+#     * Cache freeing between epochs
+#     * Regression metrics: MAE and RMSE (with BCE loss on logits)
 
-import os, random, json, time, gc
+import os, time, json, random, gc, math
 from datetime import timedelta
-from typing import Tuple, Any, Dict, Optional
+from typing import Tuple, Optional, Any, List
 
 import torch
 import torch.nn as nn
@@ -12,49 +22,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-# ---- model & config (your files) ----
-from classification import load_default_config, build_embedder, build_classifier, PairAwareClassifier
-
-# ---- datasets (your files) ----
-from Panimmnue_dataload import (  # keep your module name as-is
-    IEDBRetrainMHCDataset, collate_mhc_panimmune,
-    IntegratedTCRDataset,   collate_tcr_panimmune,
-    IntegratedAntibodyDataset, collate_antibody_panimmune,
+# ==== your modules ====
+from model_config import ModelConfig, load_default_config
+from PanImmunologyClassifier import PanImmunologyClassifier
+from Panimmune_dataload import (
+    IEDBRetrainMHCDataset,
+    IntegratedTCRDataset,
+    IntegratedAntibodyDataset,
 )
-
-# ============================= Memory helpers ============================= #
-def free_device_memory():
-    """
-    Safely clear Python refs + GPU/XPU caches.
-    Works with CUDA, XPU, or CPU backends.
-    """
-    gc.collect()  # clear Python garbage
-
-    if torch.backends.mps.is_available():  # Apple M1/M2
-        try:
-            torch.mps.empty_cache()
-            print("[Memory] Cleared MPS cache.")
-        except Exception:
-            pass
-
-    elif torch.cuda.is_available():
-        try:
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-            print("[Memory] Cleared CUDA cache.")
-        except Exception:
-            pass
-
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        try:
-            torch.xpu.empty_cache()
-            torch.xpu.reset_peak_memory_stats()
-            print("[Memory] Cleared XPU cache.")
-        except Exception:
-            pass
-
-    else:
-        print("[Memory] CPU-only system — nothing to clear.")
 
 # ============================= Defaults ============================= #
 DATA_PATHS = {
@@ -63,8 +38,7 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-# Train up to this (final) epoch number.
-EPOCHS = 10                    # <-- if resuming from 10, set this to your new target (e.g., 20)
+EPOCHS = 10
 BATCH_SIZE = 1
 BASE_LR = 3e-4
 WEIGHT_DECAY = 0.01
@@ -75,14 +49,14 @@ PERSISTENT_WORKERS = True
 SEED = 42
 
 DO_SMOKE_TEST = False
-LOCAL_TEST_100 = True          # keeps first 10 samples per dataset to sanity-check quickly
+LOCAL_TEST_100 = True
 
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
 CONFIG_OUT = os.path.join(SAVE_DIR, "config.json")
-SAVE_EVERY = 1                 # save every N epochs (full checkpoint)
+SAVE_EVERY = 1
 
-# ============================= Utilities ============================= #
+# ============================= Utils ============================= #
 def set_seed(seed: int = 42):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -106,18 +80,12 @@ def free_device_cache(device: torch.device):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     elif device.type == "xpu" and is_xpu_available():
-        try:
-            torch.xpu.synchronize()
-        except Exception:
-            pass
-        try:
-            torch.xpu.empty_cache()
-        except Exception:
-            pass
-    else:
-        gc.collect()
+        try: torch.xpu.synchronize()
+        except Exception: pass
+        try: torch.xpu.empty_cache()
+        except Exception: pass
+    gc.collect()
 
-# AMP helpers that gracefully degrade if a backend lacks AMP classes
 class _NullScaler:
     def __init__(self, enabled: bool = False): self.enabled = False
     def scale(self, x): return x
@@ -126,18 +94,15 @@ class _NullScaler:
     def update(self): pass
 
 def amp_autocast(device: torch.device):
-    """Return the correct autocast context manager for device, or a no-op."""
     if device.type == "cuda":
         return torch.cuda.amp.autocast()
     if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
-        return torch.xpu.amp.autocast()  # Intel extension
+        return torch.xpu.amp.autocast()
     from contextlib import nullcontext
     return nullcontext()
 
 def amp_scaler(device: torch.device, enabled: bool):
-    """Return a GradScaler for device if available, else a no-op scaler."""
-    if not enabled:
-        return _NullScaler()
+    if not enabled: return _NullScaler()
     if device.type == "cuda":
         return torch.cuda.amp.GradScaler(enabled=True)
     if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
@@ -146,19 +111,19 @@ def amp_scaler(device: torch.device, enabled: bool):
 
 # ============================= DDP helpers ============================= #
 def init_distributed():
-    """Initialize torch.distributed with a sensible backend for CUDA/XPU."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     global_rank = int(os.environ.get("RANK", "0"))
     device = current_device(local_rank)
 
     backend = None
+    is_ddp = False
     if world_size > 1:
         if device.type == "cuda":
             backend = "nccl"
             torch.cuda.set_device(local_rank)
         elif device.type == "xpu":
-            backend = os.environ.get("TORCH_DDP_BACKEND", "ccl")  # prefer oneCCL if present
+            backend = os.environ.get("TORCH_DDP_BACKEND", "ccl")
             try:
                 if hasattr(torch, "xpu"):
                     torch.xpu.set_device(local_rank)
@@ -166,16 +131,13 @@ def init_distributed():
                 pass
         else:
             backend = "gloo"
-
         try:
             dist.init_process_group(backend=backend, timeout=timedelta(seconds=3600))
             is_ddp = True
         except Exception as e:
             if global_rank == 0:
-                print(f"[DDP] Failed to init backend='{backend}': {e}. Falling back to single process.")
+                print(f"[DDP] init failed (backend='{backend}'): {e}. Using single process.")
             is_ddp = False
-    else:
-        is_ddp = False
 
     return is_ddp, world_size, global_rank, local_rank, device, backend
 
@@ -187,7 +149,6 @@ def barrier_if_distributed(is_ddp: bool):
         dist.barrier()
 
 def dist_mean_scalar(x: float, device: torch.device, is_ddp: bool) -> float:
-    """Synchronize scalar averages across ranks."""
     if not is_ddp or not dist.is_initialized():
         return x
     t = torch.tensor([x], dtype=torch.float32, device=device)
@@ -200,28 +161,34 @@ def build_dataset(kind: str, path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"[{kind}] Missing file: {path}")
     if kind == "mhc":
-        ds = IEDBRetrainMHCDataset(path, binarize=False, threshold=0.5)
+        ds = IEDBRetrainMHCDataset(path)
     elif kind == "tcr":
-        ds = IntegratedTCRDataset(path, binarize=False, threshold=0.5)
+        ds = IntegratedTCRDataset(path)
     elif kind == "ab":
-        ds = IntegratedAntibodyDataset(path, require_light=False, binarize=False, threshold=0.5)
+        ds = IntegratedAntibodyDataset(path, require_light=False)
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
     if LOCAL_TEST_100:
-        ds = Subset(ds, list(range(min(10, len(ds)))))
+        ds = Subset(ds, list(range(min(100, len(ds)))))
     return ds
+
+def collate_panimmune(batch: List[Tuple[str, Any]]):
+    """
+    batch: list of (concat_seq_str, label_float_in_[0,1])
+    Returns:
+        batch_seqs: List[str]
+        labels: FloatTensor [B] in [0,1]
+        extras: None
+    """
+    seqs = [s for (s, _) in batch]
+    labels = torch.tensor([float(y) for (_, y) in batch], dtype=torch.float32)
+    return seqs, labels, None
 
 def make_loader(kind: str, ds, batch_size: int, is_ddp: bool):
     sampler = DistributedSampler(ds, shuffle=True) if is_ddp else None
-    if kind == "mhc":
-        collate_fn = collate_mhc_panimmune
-    elif kind == "tcr":
-        collate_fn = collate_tcr_panimmune
-    else:
-        collate_fn = collate_antibody_panimmune
     dl = DataLoader(
         ds, batch_size=batch_size, shuffle=(sampler is None),
-        sampler=sampler, collate_fn=collate_fn,
+        sampler=sampler, collate_fn=collate_panimmune,
         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
         persistent_workers=PERSISTENT_WORKERS, drop_last=True
     )
@@ -231,7 +198,7 @@ def make_loader(kind: str, ds, batch_size: int, is_ddp: bool):
 def _get_msave(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
-def save_checkpoint(model, opt, scaler, epoch, cfg, train_sets, save_dir, device):
+def save_checkpoint(model, opt, scaler, epoch, cfg: ModelConfig, train_sets, save_dir, device):
     os.makedirs(save_dir, exist_ok=True)
     msave = _get_msave(model)
     ckpt = {
@@ -239,7 +206,8 @@ def save_checkpoint(model, opt, scaler, epoch, cfg, train_sets, save_dir, device
         "model": msave.state_dict(),
         "optimizer": opt.state_dict(),
         "scaler": (None if isinstance(scaler, _NullScaler) else scaler.state_dict()),
-        "cfg_embedder": cfg.embedder.__dict__,
+        "cfg_esm": cfg.esm.__dict__,
+        "cfg_pair": cfg.pair.__dict__,
         "cfg_classifier": cfg.classifier.__dict__,
         "train_sets": train_sets,
         "rng_state": torch.get_rng_state(),
@@ -247,14 +215,11 @@ def save_checkpoint(model, opt, scaler, epoch, cfg, train_sets, save_dir, device
     }
     if torch.cuda.is_available():
         ckpt["cuda_rng_state"] = torch.cuda.get_rng_state()
-    torch.save(ckpt, os.path.join(save_dir, f"ckpt_epoch{epoch}.pt"))
-    print(f"[Save] Full checkpoint: {os.path.join(save_dir, f'ckpt_epoch{epoch}.pt')}")
+    path = os.path.join(save_dir, f"ckpt_epoch{epoch}.pt")
+    torch.save(ckpt, path)
+    print(f"[Save] Full checkpoint: {path}")
 
 def load_checkpoint_if_any(resume_from: str, model, opt, scaler, device) -> int:
-    """
-    Returns next_epoch index to start from (last_epoch + 1).
-    Call this on ALL ranks after DDP wrapping.
-    """
     if not resume_from:
         return 1
     if not os.path.exists(resume_from):
@@ -298,23 +263,34 @@ def load_split_epoch(model, embedder_path: str, head_path: str, device, strict: 
 
     mp = torch.load(embedder_path, map_location=device)
     hp = torch.load(head_path,    map_location=device)
-    msave.embedder.load_state_dict(mp["state_dict"], strict=True)
+    msave.embeder.load_state_dict(mp["state_dict"], strict=True)
 
-    # Load “head” (everything not under embedder.)
     head_state = hp["state_dict"]
     missing, unexpected = msave.load_state_dict(head_state, strict=False)
     print(f"[Resume-split] missing={missing} unexpected={unexpected}")
 
-# ============================= Training functions ============================= #
+# ============================= Train/Eval ============================= #
 def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, grad_clip_norm: float, use_amp: bool):
-    total, correct, total_loss = 0, 0, 0.0
+    """
+    Returns: loss_avg, mae_avg, rmse_avg (averaged over the dataset on this rank)
+    """
+    total = 0
+    loss_sum = 0.0
+    mae_sum = 0.0
+    mse_sum = 0.0
+
     scaler = amp_scaler(device, enabled=use_amp)
 
-    for batch_samples, labels, _ in dl:
+    for batch_seqs, labels, _ in dl:  # batch_seqs: List[str]; labels: float32 [B] in [0,1]
         labels = labels.to(device, non_blocking=True)
+
         opt.zero_grad(set_to_none=True)
         with amp_autocast(device):
-            logits = model(batch_samples)    # model handles encoding & internal device use
+            logits = model(batch_seqs)            # [B, num_classes or 1]
+            # Ensure single logit for BCE; if model outputs >1, take the first channel
+            if logits.dim() == 2 and logits.size(1) != 1:
+                logits = logits[:, :1]
+            logits = logits.squeeze(-1)           # [B]
             loss = loss_fn(logits, labels)
 
         if isinstance(scaler, _NullScaler):
@@ -331,73 +307,84 @@ def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device, gra
             scaler.update()
 
         with torch.no_grad():
-            preds = logits.argmax(dim=1)
-            total += labels.numel()
-            correct += (preds == labels).sum().item()
-            total_loss += float(loss.item()) * labels.size(0)
+            preds = torch.sigmoid(logits)         # [B] in [0,1]
+            bsz = labels.size(0)
+            total += bsz
+            loss_sum += float(loss.item()) * bsz
+            mae_sum  += torch.sum(torch.abs(preds - labels)).item()
+            mse_sum  += torch.sum((preds - labels) ** 2).item()
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    # per-rank averages
+    loss_avg = loss_sum / max(total, 1)
+    mae_avg  = mae_sum  / max(total, 1)
+    rmse_avg = math.sqrt(mse_sum / max(total, 1)) if total > 0 else 0.0
+    return loss_avg, mae_avg, rmse_avg
 
 @torch.no_grad()
 def smoke_test(model, dl, name, device, do_print=True):
     try:
-        batch_samples, labels, _ = next(iter(dl))
+        batch_seqs, labels, _ = next(iter(dl))
     except StopIteration:
         if do_print:
             print(f"[{name}] dataset empty — skipping.")
         return
     labels = labels.to(device, non_blocking=True)
-    logits = model(batch_samples)
+    logits = model(batch_seqs)
+    if logits.dim() == 2 and logits.size(1) != 1:
+        logits = logits[:, :1]
+    preds = torch.sigmoid(logits.squeeze(-1))
     if do_print:
-        print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | labels={tuple(labels.shape)}")
+        print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | preds≈[{preds.min():.3f},{preds.max():.3f}] | labels={tuple(labels.shape)}")
 
-# ============================= Main training loop ============================= #
+# ============================= Main loop ============================= #
 def run_training(train_sets,
                  epochs=EPOCHS, batch_size=BATCH_SIZE,
                  lr=BASE_LR, weight_decay=WEIGHT_DECAY, save_every=SAVE_EVERY,
                  save_dir=SAVE_DIR, config_out=CONFIG_OUT,
                  resume_from: str = "",
                  resume_split: Optional[Tuple[str, str, int]] = None):
-    """
-    resume_from: path to full checkpoint (ckpt_epochX.pt). If provided, takes precedence.
-    resume_split: tuple (embedder_path, head_path, start_epoch) for legacy split saves.
-    """
+
     set_seed(SEED)
     is_ddp, world_size, global_rank, local_rank, device, backend = init_distributed()
     is_main = is_main_process(global_rank)
 
-    # Perf knobs
+    # perf knobs
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    use_amp = device.type in ("cuda", "xpu")  # enable AMP on CUDA and XPU (if available)
+    use_amp = device.type in ("cuda", "xpu")
 
     if is_main:
         print(f"[Init] DDP={is_ddp} backend={backend} world_size={world_size} local_rank={local_rank} device={device} | TrainSets={train_sets}")
 
-    # ==== Build model ====
-    cfg = load_default_config()
-    cfg.embedder.freeze_esm = True
-    embedder = build_embedder(cfg.embedder, device=device)
-    model = build_classifier(embedder, cfg.classifier, device=device)
+    # ==== Build model from unified config ====
+    cfg: ModelConfig = load_default_config()
+    # NOTE: BCEWithLogitsLoss expects a single logit; ensure num_classes==1 in cfg.classifier.
+    if hasattr(cfg.classifier, "num_classes") and cfg.classifier.num_classes != 1:
+        if is_main:
+            print(f"[Warn] cfg.classifier.num_classes={cfg.classifier.num_classes} -> expected 1 for BCE. "
+                  f"The trainer will slice to the first channel at runtime.")
+    model = PanImmunologyClassifier.from_config(cfg.classifier, cfg.esm, cfg.pair)
+    model = model.to(device)
 
     if is_ddp:
         ddp_kwargs = {"device_ids": [local_rank]} if device.type != "cpu" else {}
         model = DDP(model, find_unused_parameters=True, **ddp_kwargs)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.BCEWithLogitsLoss()
     scaler = amp_scaler(device, enabled=use_amp)
 
-    # ==== Resume logic ====
+    # ==== Resume ====
     if resume_from:
         start_epoch = load_checkpoint_if_any(resume_from, model, opt, scaler, device)
     elif resume_split:
         emb_path, head_path, start_epoch_hint = resume_split
         load_split_epoch(model, emb_path, head_path, device, strict=True)
         start_epoch = int(start_epoch_hint)
-        print(f"[Resume-split] Starting from epoch {start_epoch} (optimizer/scaler reset).")
+        if is_main:
+            print(f"[Resume-split] Starting from epoch {start_epoch} (optimizer/scaler reset).")
     else:
         start_epoch = 1
 
@@ -410,8 +397,7 @@ def run_training(train_sets,
             dl, sampler = make_loader(kind, ds, batch_size, is_ddp)
             loaders[kind], samplers[kind] = dl, sampler
         except FileNotFoundError as e:
-            if is_main:
-                print(e)
+            if is_main: print(e)
 
     if not loaders:
         raise RuntimeError("No datasets found!")
@@ -420,50 +406,51 @@ def run_training(train_sets,
         for k, sz in sizes.items():
             print(f"[Data] {k}: {sz} samples (per-rank batch={batch_size})")
 
-    # ==== Optional smoke test (rank-0) ====
+    # Optional smoke
     if DO_SMOKE_TEST and is_main:
         model.eval()
         for k, dl in loaders.items():
             smoke_test(model, dl, f"{k.upper()}(train)", device)
         model.train()
 
-    # >>>>>>>>>> EMPTY CACHE BEFORE TRAINING <<<<<<<<<<
     barrier_if_distributed(is_ddp)
     free_device_cache(device)
 
-    # ==== Train loop ====
+    # ==== Train ====
     for epoch in range(start_epoch, epochs + 1):
-        # distinct shuffles across epochs (DDP)
-        for k, sampler in samplers.items():
+        # shuffle per-epoch in DDP
+        for sampler in samplers.values():
             if isinstance(sampler, DistributedSampler):
                 sampler.set_epoch(epoch)
 
         if is_main:
             print(f"\n=== Epoch {epoch} ===")
         per_ds_metrics = {}
-        start_t = time.time()
+        t0 = time.time()
 
         model.train()
         for k, dl in loaders.items():
-            loss_local, acc_local = train_one_loader(model, dl, loss_fn, opt, device, GRAD_CLIP_NORM, use_amp)
-            # reduce to global means
+            loss_local, mae_local, rmse_local = train_one_loader(
+                model, dl, loss_fn, opt, device, GRAD_CLIP_NORM, use_amp
+            )
+            # reduce to global means (per-rank averages -> mean across ranks)
             loss_avg = dist_mean_scalar(loss_local, device, is_ddp)
-            acc_avg  = dist_mean_scalar(acc_local,  device, is_ddp)
-            per_ds_metrics[k] = (loss_avg, acc_avg)
+            mae_avg  = dist_mean_scalar(mae_local,  device, is_ddp)
+            rmse_avg = dist_mean_scalar(rmse_local, device, is_ddp)
+            per_ds_metrics[k] = (loss_avg, mae_avg, rmse_avg)
             if is_main:
-                print(f"[{k}] loss={loss_avg:.4f}  acc={acc_avg:.3f}")
+                print(f"[{k}] loss={loss_avg:.4f}  MAE={mae_avg:.4f}  RMSE={rmse_avg:.4f}")
 
         # average across datasets
-        avg_loss = sum(l for l, _ in per_ds_metrics.values()) / len(per_ds_metrics)
-        avg_acc  = sum(a for _, a in per_ds_metrics.values()) / len(per_ds_metrics)
+        avg_loss = sum(l for l, _, _ in per_ds_metrics.values()) / len(per_ds_metrics)
+        avg_mae  = sum(m for _, m, _ in per_ds_metrics.values()) / len(per_ds_metrics)
+        avg_rmse = sum(r for _, _, r in per_ds_metrics.values()) / len(per_ds_metrics)
         if is_main:
-            print(f"[avg] loss={avg_loss:.4f} acc={avg_acc:.3f} time={time.time()-start_t:.1f}s")
+            print(f"[avg] loss={avg_loss:.4f}  MAE={avg_mae:.4f}  RMSE={avg_rmse:.4f}  time={time.time()-t0:.1f}s")
 
-        # save checkpoints (rank 0)
         if (epoch % save_every == 0) and is_main:
-            save_checkpoint(model, opt, scaler, epoch, cfg, list(loaders.keys()), save_dir, device)
+            save_checkpoint(model, opt, scaler, epoch, cfg, list(loaders.keys()), SAVE_DIR, device)
 
-        # sync and free memory caches AFTER each epoch
         barrier_if_distributed(is_ddp)
         free_device_cache(device)
 
@@ -473,26 +460,26 @@ def run_training(train_sets,
 
     if is_main:
         msave = _get_msave(model)
-        emb_path = os.path.join(save_dir, "embedder_final.pt")
-        cls_path = os.path.join(save_dir, "classification_final.pt")
-        torch.save({"state_dict": msave.embedder.state_dict()}, emb_path)
-        head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embedder.")}
+        emb_path = os.path.join(SAVE_DIR, "embedder_final.pt")
+        cls_path = os.path.join(SAVE_DIR, "classification_final.pt")
+        torch.save({"state_dict": msave.embeder.state_dict()}, emb_path)
+        head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embeder.")}
         torch.save({"state_dict": head_state}, cls_path)
         print(f"[Save] Inference weights: {emb_path} | {cls_path}")
 
-        # config dump
-        with open(config_out, "w") as f:
+        with open(CONFIG_OUT, "w") as f:
             json.dump({
-                "embedder": cfg.embedder.__dict__,
+                "esm": cfg.esm.__dict__,
+                "pair": cfg.pair.__dict__,
                 "classifier": cfg.classifier.__dict__,
                 "train": {
                     "epochs": epochs, "batch_size_per_rank": batch_size,
-                    "lr": lr, "weight_decay": weight_decay, "seed": SEED,
+                    "lr": BASE_LR, "weight_decay": WEIGHT_DECAY, "seed": SEED,
                     "grad_clip_norm": GRAD_CLIP_NORM, "local_test_100": LOCAL_TEST_100,
                     "train_sets": train_sets, "world_size": world_size, "backend": backend
                 }
             }, f, indent=2)
-        print(f"[Save] Config: {config_out}")
+        print(f"[Save] Config: {CONFIG_OUT}")
 
     if is_ddp and dist.is_initialized():
         dist.destroy_process_group()
@@ -503,18 +490,9 @@ if __name__ == "__main__":
     TRAIN_SETS = ["mhc", "tcr", "ab"]
     selected_sets = ["ab"] if MHC_ONLY else TRAIN_SETS
 
-    # --- Choose exactly one of these resume modes ---
-    # 1) Full checkpoint resume (best, restores optimizer/scaler/RNG/epoch)
-    RESUME = ""  # e.g., "model_parameter/ckpt_epoch10.pt"
-
-    # 2) Legacy split weights resume (only model weights). Tuple: (embedder_pt, classifier_pt, start_epoch)
-    RESUME_SPLIT = None
-    # Example:
-    # RESUME_SPLIT = (
-    #     "model_parameter/embedder_epoch10.pt",
-    #     "model_parameter/classification_epoch10.pt",
-    #     11
-    # )
+    # Resume options
+    RESUME = ""          # e.g., "model_parameter/ckpt_epoch10.pt"
+    RESUME_SPLIT = None  # e.g., ("embedder_epoch10.pt", "classification_epoch10.pt", 11)
 
     run_training(
         train_sets=selected_sets,
