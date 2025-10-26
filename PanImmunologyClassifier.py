@@ -94,7 +94,7 @@ if __name__ == "__main__":
 
     cfg = ZClassifierConfig(pair_dim=128, num_classes=3)
     model = PanImmunologyClassifier.from_config(cfg, esm_cfg, pair_cfg)
-
-    seqs = ["ACDEFG:LMNPQR", "MKTFF:GGGGG", "VVVVV:DDDDDDDDD"]
+    
+    seqs = ["ACDEFG:LMNPQR", "MKTFF:GGGGG:GGGGGGG", "VVVVV:DDDDDDDDD"]
     logits = model(seqs)
     print("logits shape:", logits.shape)  # [B, num_classes]

@@ -75,49 +75,55 @@ class LinearProjectedESM(nn.Module):
             emb = hidden[0, 1:-1, :]       # strip BOS/EOS -> [L, H]
             return self.projector(emb)     # [L, proj_dim]
 
-        # sliding windows
+        # ---- sliding windows ----
         win, stride, L = L_max, self.cfg.stride, len(sequence)
         assert 0 < stride <= win, "stride must be in (0, win]"
+
         pieces: List[torch.Tensor] = []
         weights: List[torch.Tensor] = []
+        starts: List[int] = []
+
         start = 0
         while start < L:
             end = min(start + win, L)
             subseq = sequence[start:end]
+
             inputs = self.tokenizer(subseq, return_tensors="pt", add_special_tokens=True)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             out = self.model(**inputs, output_hidden_states=True)
             hidden = out.last_hidden_state if self.cfg.layer is None else out.hidden_states[self.cfg.layer]
-            rep = hidden[0, 1:-1, :]                 # [l_chunk, H]
-            rep = self.projector(rep)                # [l_chunk, proj_dim]
+            rep = hidden[0, 1:-1, :]              # [l_chunk, H]
+            rep = self.projector(rep)             # [l_chunk, proj_dim]
             pieces.append(rep)
+            starts.append(start)
 
             # cosine ramp weights (smooth overlap)
-            w = torch.ones(rep.size(0), device=self.device, dtype=rep.dtype)
+            l_chunk = rep.size(0)
+            w = torch.ones(l_chunk, device=self.device, dtype=rep.dtype)
             if start > 0:
-                ramp = torch.linspace(0, math.pi, steps=min(stride, rep.size(0)), device=self.device)
+                ramp = torch.linspace(0, math.pi, steps=min(stride, l_chunk), device=self.device, dtype=rep.dtype)
                 w[: ramp.numel()] *= 0.5 * (1 - torch.cos(ramp))
             if end < L:
-                ramp = torch.linspace(0, math.pi, steps=min(stride, rep.size(0)), device=self.device)
+                ramp = torch.linspace(0, math.pi, steps=min(stride, l_chunk), device=self.device, dtype=rep.dtype)
                 w[- ramp.numel():] *= 0.5 * (1 - torch.cos(ramp))
             weights.append(w)
 
             if end == L:
                 break
-            start = end - stride
+            start = end - stride  # <-- this is the *only* advance rule we use
 
         H = pieces[0].size(1)
-        # stitch via weighted sum / denom; build differentiable graph
         out = torch.zeros((L, H), device=self.device, dtype=pieces[0].dtype)
         denom = torch.zeros((L,), device=self.device, dtype=pieces[0].dtype)
-        start = 0
-        for rep, w in zip(pieces, weights):
+
+        # stitch with recorded starts (no guessed offsets)
+        for rep, w, s in zip(pieces, weights, starts):
             l = rep.size(0)
-            # write in-place to keep graph small but valid (no detach)
-            out[start:start+l] = out[start:start+l] + rep * w[:, None]
-            denom[start:start+l] = denom[start:start+l] + w
-            start += l if start == 0 else (l - stride)
+            out[s:s+l] = out[s:s+l] + rep * w[:, None]
+            denom[s:s+l] = denom[s:s+l] + w
+
         return out / denom.clamp_min(1e-6)[:, None]
+
 
     def forward(self, batch: List[str]) -> Union[List[torch.Tensor], torch.Tensor]:
         reps: List[torch.Tensor] = [self.embed(seq) for seq in batch]   # each [L_i, proj_dim]
@@ -435,11 +441,7 @@ if __name__ == "__main__":
     model.train()  # if freeze=True, ESM params stay frozen but will mirror train() for projector
 
     batch = [
-        "ACDEFGHIKLMNPQRSTVWY:ACDEFGHIKLMNPQRSTVWY",
-        "MKTFFVLLL:GGGGGGGGGGGGG",
-        "MKTFFVLLL:GGGGGGGGGGGGG",
-        "MKTFFVLLL:GGGGGGGGGGGGG",
-        "MKTFFVLLL:GGGGGGGGGGGGG",
+        "QVQLVQSGAEVKKPGSSVKVSCKASGGTFSSYAISWVRQAPGQGLEWMGGIIPIFGTANYAQKFQGRVTITADKSTSTAYMELSSLRSEDTAVYYCAREGEGWFGKPLRAFEFWGQGTVITVSSASTKGPSVFPLAPSSKSTSGGTAALGCLVKDYFPEPVTVSWNSGALTSGVHTFPAVLQSSGLYSLSSVVTVPSSSLGTQTYICNVNHKPSNTKVDKKVEPKSC:EIVLTQSPGTLSLSPGERATLSCRASQSVSSSYLAWYQQKPGQAPRLLIYGASSRATGIPDRFSGSGSGTDFTLTISRLEPEDFAVYYCQQYGTSQSTFGQGTRLEIKRTVAAPSVFIFPPSDEQLKSGTASVVCLLNNFYPREAKVQWKVDNALQSGNSQESVTEQDSKDSTYSLSSTLTLSKADYEKHKVYACEVTHQGLSSPVTKSFNRGEC:MIHSVFLLMFLLTPTESYVDVGPDSVKSACIEVDIQQTFFDKTWPRPIDVSKADGIIYPQGRTYSNITITYQGLFPYQGDHGDMYVYSAGHATGTTPQKLFVANYSQDVKQFANGFVVRIGAAANSTGTVIISPSTSATIRKIYPAFMLGSSVGNFSDGKMGRFFNHTLVLLPDGCGTLLRAFYCILEPRSGNHCPAGNSYTSFATYHTPATDCSDGNYNRNASLNSFKEYFNLRNCTFMYTYNITEDEILEWFGITQTAQGVHLFSSRYVDLYGGNMFQFATLPVYDTIKYYSIIPHSIRSIQSDRKAWAAFYVYKLQPLTFLLDFSVDGYIRRAIDCGFNDLSQLHCSYESFDVESGVYSVSSFEAKPSGSVVEQAEGVECDFSPLLSGTPPQVYNFKRLVFTNCNYNLTKLLSLFSVNDFTCSQISPAAIASNCYSSLILDYFSYPLSMKSDLSVSSAGPISQFNYKQSFSNPTCLILATVPHNLTTITKPLKYSYINKCSRLLSDDRTEVPQLVNANQYSPCVSIVPSTVWEDGDYYRKQLSPLEGGGWLVASGSTVAMTEQLQMGFGITVQYGTDTNSVCPKLEFANDTKIASQLGNCVEYSLYGVSGRGVFQNCTAVGVRQQRFVYDAYQNLVGYYSDDGNYYCLRACVSVPVSVIYDKETKTHATLFGSVACEHISSTMSQYSRSTRSMLKRRDSTYGPLQTPVGCVLGLVNSSLFVEDCKLPLGQSLCALPDTPSTLTPRSVRSVPGEMRLASIAFNHPIQVDQLNSSYFKLSIPTNFSFGVTQEYIQTTIQKVTVDCKQYVCNGFQKCEQLLREYGQFCSKINQALHGANLRQDDSVRNLFASVKSSQSSPIIPGFGGDFNLTLLEPVSISTGSRSARSAIEDLLFDKVTIADPGYMQGYDDCMQQGPASARDLICAQYVAGYKVLPPLMDVNMEAAYTSSLLGSIAGVGWTAGLSSFAAIPFAQSIFYRLNGVGITQQVLSENQKLIANKFNQALGAMQTGFTTTNEAFQKVQDAVNNNAQALSKLASELSNTFGAISASIGDIIQRLDVLEQDAQIDRLINGRLTTLNAFVAQQLVRSESAALSAQLAKDKVNECVKAQSKRSGFCGQGTHIVSFVVNAPNGLYFMHVGYYPSNHIEVVSAYGLCDAANPTNCIAPVNGYFIKTNNTRIVDEWSYTGSSFYAPEPITSLNTKYVAPQVTYQNISTNLPPPLLGNSTGIDFQDELDEFFKNVSTSIPNFGSLTQINTTLLDLTYEMLSLQQVVKALNESYIDLKELGNYTYYNKWPWYIWLGFIAGLVALALCVFFILCCTGCGTNCMGKLKCNRCCDRYEEYDLEPHKVHVH",
     ]
     z = model(batch)
     print("z shape:", tuple(z.shape))

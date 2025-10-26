@@ -165,11 +165,11 @@ def build_dataset(kind: str, path: str):
     elif kind == "tcr":
         ds = IntegratedTCRDataset(path)
     elif kind == "ab":
-        ds = IntegratedAntibodyDataset(path, require_light=False)
+        ds = IntegratedAntibodyDataset(path, require_light=True)
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
     if LOCAL_TEST_100:
-        ds = Subset(ds, list(range(min(100, len(ds)))))
+        ds = Subset(ds, list(range(min(10, len(ds)))))
     return ds
 
 def collate_panimmune(batch: List[Tuple[str, Any]]):
@@ -421,7 +421,7 @@ def run_training(train_sets,
 
     if is_ddp:
         ddp_kwargs = {"device_ids": [local_rank]} if device.type != "cpu" else {}
-        model = DDP(model, find_unused_parameters=True, **ddp_kwargs)
+        model = DDP(model, find_unused_parameters=False, **ddp_kwargs)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.BCEWithLogitsLoss()

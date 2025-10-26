@@ -144,7 +144,7 @@ if __name__ == "__main__":
 
     if os.path.exists(paths["AB"]):
         ds = IntegratedAntibodyDataset(paths["AB"], require_light=False)
-        dl = DataLoader(ds, batch_size=2, shuffle=False)
+        dl = DataLoader(ds, batch_size=1000, shuffle=True)
         seqs, labels = next(iter(dl))
-        print("[AB] seqs:", seqs)
+        #print("[AB] seqs:", seqs)
         print("[AB] labels:", labels.tolist() if hasattr(labels, 'tolist') else labels)
