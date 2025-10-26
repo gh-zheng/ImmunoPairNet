@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Any, List, Tuple
+import random
 
 # ============================ Cleaning utils ============================ #
 VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
@@ -113,6 +114,7 @@ class IntegratedAntibodyDataset(Dataset):
             if len(r["Light_chain"]) > 0:
                 parts.append(r["Light_chain"])
         parts.append(r["Antigen"])
+        random.shuffle(parts)
         concat = self.sep.join(parts)
         label = r["Label"]  # keep label as-is
         return concat, label

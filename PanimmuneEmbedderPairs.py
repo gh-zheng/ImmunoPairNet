@@ -1,145 +1,80 @@
-# PanimmuneEmbedderPairs.py
+# PanimmuneEmbedderPairs.py  (ESM-free, one-hot front end)
 """
-Panimmune Pairwise U-Net (Axial Transformer Stack, ESM freeze toggle) — Memory-safe
-- ESM -> projector with STREAMING sliding windows (O(1) extra memory)
-- Optional ESM-on-CPU; projector/U-Net on GPU (cfg.run_esm_device="cpu")
+Panimmune Pairwise U-Net (Axial Transformer Stack) — ESM removed
+- Input: concatenated chains with ':' separators (e.g., "HSEQ:LSEQ:ANTIGEN")
+- One-hot (20 AA only, separators ':' removed) -> Linear projector to proj_dim
 - Single->Pair: outer-product style init to [B, L, L, pair_dim]
-- Early downsampling (pre_pool_factor in {1,2,4}) to save memory
-- U-Net over the (downsampled) pair grid; axial Transformer bottleneck
-- Exact 1D mask resize to bottleneck size; final output is restored to original L×L
+- U-Net over the pair grid [L x L]: ResNet encoder (stride-2), Axial Transformer bottleneck, ResNet decoder
+- Exact 1D mask resize to match bottleneck grid side length
 - SDPA/Flash friendly (need_weights=False), optional row chunking
 """
 from __future__ import annotations
 import math
+from dataclasses import dataclass
 from typing import List, Tuple, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model_config import ESMConfig, PairConfig
-
-
-# ---- ESM (HuggingFace) ----
+# from model_config import PairConfig  # keep your existing PairConfig
 try:
-    from transformers import EsmTokenizer, EsmModel
-except Exception:  # pragma: no cover
-    EsmTokenizer = None
-    EsmModel = None
+    from model_config import PairConfig
+except Exception:
+    @dataclass
+    class PairConfig:
+        proj_dim: int = 128
+        pair_dim: int = 128
+        unet_base_channels: int = 128
+        unet_depth: int = 3
+        n_transformers: int = 2
+        mha_heads: int = 8
+        dropout: float = 0.1
+        chunk_rows: int = 0
 
 
-# ===================== ESM (auto-projected, streaming) ====================== #
-class LinearProjectedESM(nn.Module):
+# ============================ One-hot front end ============================ #
+class OneHotAAProjector(nn.Module):
     """
-    Wrap ESM; auto-detect hidden size and project to proj_dim.
-    Long sequences use streaming sliding windows (no storing all chunks).
+    Convert AA sequence (20 standard AAs) into one-hot vectors [L, 20] and linearly
+    project to [L, proj_dim]. ':' separators are stripped. Non-20-AA letters raise.
     """
-    def __init__(self, cfg: ESMConfig, proj_dim: int, device: Optional[torch.device] = None):
+    AA20 = "ACDEFGHIKLMNPQRSTVWY"
+    _AA_TO_IDX = {aa: i for i, aa in enumerate(AA20)}
+
+    def __init__(self, proj_dim: int, device: Optional[torch.device] = None):
         super().__init__()
-        assert EsmTokenizer is not None and EsmModel is not None, "Install transformers to use ESM."
-        self.cfg = cfg
+        self.proj = nn.Linear(20, proj_dim, bias=True)
         self.device = device if device is not None else torch.device("cpu")
+        self.to(self.device)
 
-        # ESM backbone device (CPU offload optional)
-        run_esm_device = getattr(cfg, "run_esm_device", "same")  # "same" | "cpu" | "cuda"
-        self.esm_device = self.device if run_esm_device == "same" else torch.device(run_esm_device)
-
-        self.tokenizer = EsmTokenizer.from_pretrained(cfg.model_name)
-        self.model = EsmModel.from_pretrained(cfg.model_name).to(self.esm_device)
-
-        try:
-            self.tokenizer.padding_side = cfg.pad_side
-        except Exception:
-            pass
-
-        in_dim = int(self.model.config.hidden_size)
-        self.projector = nn.Linear(in_dim, proj_dim, bias=True).to(self.device)
-
-        # freeze or not
-        if self.cfg.freeze:
-            for p in self.model.parameters():
-                p.requires_grad = False
-
-    def _esm_hidden_one(self, seq_piece: str) -> torch.Tensor:
-        """Run one chunk through ESM (on esm_device); return [l, H_in] on esm_device."""
-        # Normalize chain separators so length accounting stays predictable
-        seq_piece = seq_piece.replace(getattr(self.cfg, "sep_token", ":"), "X")
-
-        # Important: restrict hidden_states output unless we actually need a chosen layer
-        need_hs = (self.cfg.layer is not None)
-        with torch.no_grad() if self.cfg.freeze else torch.enable_grad():
-            inputs = self.tokenizer(seq_piece, return_tensors="pt", add_special_tokens=True)
-            inputs = {k: v.to(self.esm_device, non_blocking=True) for k, v in inputs.items()}
-            out = self.model(**inputs, output_hidden_states=need_hs)
-            if need_hs:
-                hidden = out.hidden_states[self.cfg.layer][0, 1:-1, :]
-            else:
-                hidden = out.last_hidden_state[0, 1:-1, :]
-            # free HF containers promptly
-            del out, inputs
-        return hidden  # on esm_device
+    @classmethod
+    def _clean_and_index(cls, seq: str) -> torch.Tensor:
+        # Remove ':' separators; uppercase; validate only 20 AA letters
+        seq = seq.replace(":", "").upper()
+        if not seq:
+            raise ValueError("Empty sequence after removing ':' separators.")
+        idxs = []
+        for ch in seq:
+            if ch not in cls._AA_TO_IDX:
+                raise ValueError(
+                    f"Invalid residue '{ch}'. Only 20 AA letters allowed: {cls.AA20}"
+                )
+            idxs.append(cls._AA_TO_IDX[ch])
+        return torch.tensor(idxs, dtype=torch.long)
 
     def embed(self, sequence: str) -> torch.Tensor:
         """
-        Return [L, proj_dim] for a single concatenated sequence.
-        Streaming sliding windows: compute→stitch directly into buffers.
+        Returns [L, proj_dim] for a single sequence (':' removed).
         """
-        self.model.train(self.training)
-
-        L = len(sequence)
-        L_max = int(self.cfg.max_tokens) - 2  # reserve BOS/EOS
-
-        # Fast path (single window)
-        if L <= L_max:
-            hidden = self._esm_hidden_one(sequence)                             # [L, H_in] on esm_device
-            hidden = hidden.to(self.device, non_blocking=True)                  # move once
-            rep = self.projector(hidden)                                        # [L, proj_dim]
-            del hidden
-            return rep
-
-        # ---- Streaming windows (O(1) extra memory) ----
-        win, stride = L_max, int(self.cfg.stride)
-        assert 0 < stride <= win, "stride must be in (0, win]"
-
-        Hproj = int(self.projector.out_features)
-        out = torch.zeros((L, Hproj), device=self.device)
-        denom = torch.zeros((L,), device=self.device)
-
-        # reuse cosine fade up to 'stride'
-        ramp = torch.linspace(0, math.pi, steps=stride, device=self.device)
-        fade = 0.5 * (1 - torch.cos(ramp))
-
-        start = 0
-        while start < L:
-            end = min(start + win, L)
-            subseq = sequence[start:end]
-
-            hidden = self._esm_hidden_one(subseq)                 # [l, H_in] esm_device
-            hidden = hidden.to(self.device, non_blocking=True)
-            rep = self.projector(hidden)                           # [l, Hproj]
-            del hidden
-
-            l = rep.size(0)
-            w = torch.ones(l, device=self.device, dtype=rep.dtype)
-            if start > 0:
-                k = min(stride, l); w[:k] *= fade[:k]
-            if end < L:
-                k = min(stride, l); w[-k:] *= fade[:k]
-
-            out[start:end] += rep * w[:, None]
-            denom[start:end] += w
-
-            del rep, w
-            if end == L:
-                break
-            start = end - stride
-
-        return out / denom.clamp_min(1e-6)[:, None]
+        idx = self._clean_and_index(sequence).to(self.device)                     # [L]
+        onehot = F.one_hot(idx, num_classes=20).to(dtype=torch.float32)           # [L, 20]
+        return self.proj(onehot)                                                  # [L, proj_dim]
 
     def forward(self, batch: List[str]) -> Union[List[torch.Tensor], torch.Tensor]:
-        reps: List[torch.Tensor] = [self.embed(seq) for seq in batch]   # each [L_i, proj_dim]
+        reps: List[torch.Tensor] = [self.embed(seq) for seq in batch]             # [L_i, proj_dim]
         Ls = [t.size(0) for t in reps]
         if len(set(Ls)) == 1:
-            return torch.stack(reps, dim=0)  # [B, L, proj_dim]
+            return torch.stack(reps, dim=0)                                       # [B, L, proj_dim]
         return reps  # ragged; caller will pad
 
 
@@ -264,7 +199,6 @@ class AxialSelfAttention2D(nn.Module):
         zr = z.reshape(B * L, L, H)
         key_padding = None
         if mask_1d is not None:
-            # mask_1d: [B, L] (True=valid) -> key_padding (True=pad)
             m = (~mask_1d.bool())
             key_padding = m.unsqueeze(1).expand(B, L, L).reshape(B * L, L)
         r_out = self._run_chunked(self.row_mha, zr, key_padding)
@@ -329,14 +263,16 @@ class AxialTransformerStack(nn.Module):
 class PanimmuneEmbedderPairs(nn.Module):
     """
     End-to-end:
-      batch_seqs (concat) -> ESM -> projector -> Single->Pair -> U-Net
-    Forward returns the updated pair tensor: [B, L, L, pair_dim] with L = original token length.
+      batch_seqs (concat with ':') -> one-hot(20) -> projector -> Single->Pair -> U-Net
+    Forward returns the updated pair tensor: [B, L, L, pair_dim]
     """
-    def __init__(self, esm_cfg: ESMConfig, pair_cfg: PairConfig, device: Optional[torch.device] = None):
+    def __init__(self, pair_cfg: PairConfig, device: Optional[torch.device] = None):
         super().__init__()
         self.device = device if device is not None else torch.device("cpu")
-        self.esm = LinearProjectedESM(esm_cfg, pair_cfg.proj_dim, device=self.device)
         self.pair_cfg = pair_cfg
+
+        # One-hot → projector
+        self.fe = OneHotAAProjector(proj_dim=pair_cfg.proj_dim, device=self.device)
 
         # Single -> Pair
         self.single_to_pair = PairInitOPM(pair_cfg.proj_dim, pair_cfg.pair_dim, use_bias=True)
@@ -344,15 +280,6 @@ class PanimmuneEmbedderPairs(nn.Module):
         # U-Net encoder
         C0 = pair_cfg.unet_base_channels
         self.in_conv = nn.Conv2d(pair_cfg.pair_dim, C0, 3, padding=1)
-
-        # Early downsampling to reduce side length; we will restore to original L×L at the end
-        self.pre_pool_factor = int(getattr(pair_cfg, "pre_pool_factor", 1))
-        assert self.pre_pool_factor in (1, 2, 4), "pre_pool_factor must be 1, 2, or 4"
-        self.pre_pool = (
-            nn.Identity() if self.pre_pool_factor == 1 else
-            nn.AvgPool2d(kernel_size=self.pre_pool_factor, stride=self.pre_pool_factor)
-        )
-
         downs, ch = [], C0
         for _ in range(pair_cfg.unet_depth):
             downs.append(DownStage(ch, ch * 2, pair_cfg.dropout))
@@ -368,13 +295,12 @@ class PanimmuneEmbedderPairs(nn.Module):
             chunk_rows=pair_cfg.chunk_rows,
         )
 
-        # U-Net decoder (c_skip equals current 'ch' at each level)
+        # U-Net decoder  (c_skip equals current 'ch' at each level)
         ups = []
         for _ in range(pair_cfg.unet_depth):
             ups.append(UpStage(c_in=ch, c_skip=ch, c_out=ch // 2, dropout=pair_cfg.dropout))
             ch = ch // 2
         self.ups = nn.ModuleList(ups)
-
         self.out_conv = nn.Conv2d(C0, pair_cfg.pair_dim, 3, padding=1)
 
         self.to(self.device)
@@ -403,6 +329,7 @@ class PanimmuneEmbedderPairs(nn.Module):
     def _resize_mask_1d(mask: torch.Tensor, target_len: int) -> torch.Tensor:
         """
         Exact resize of a boolean mask [B, L] -> [B, target_len] using nearest interpolation.
+        Guarantees the side length matches the bottleneck grid even for odd L / ceil downsamples.
         """
         B, L = mask.shape
         if L == target_len:
@@ -414,17 +341,13 @@ class PanimmuneEmbedderPairs(nn.Module):
 
     # ---------- forward ----------
     def forward(self, batch_seqs: List[str], return_intermediates: bool = False):
-        # 1) ESM embeddings (projected), ragged->padded
-        s_list_or_tensor = self.esm(batch_seqs)       # list([L_i, proj_dim]) or [B, L, proj_dim]
-        s, smask = self._ensure_batched(s_list_or_tensor)  # [B, L, P], [B, L]
-        L0 = s.size(1)  # original token length (we will restore to this)
+        # 1) One-hot embeddings (projected), ragged->padded
+        s_list_or_tensor = self.fe(batch_seqs)              # list([L_i, proj_dim]) or [B, L, proj_dim]
+        s, smask = self._ensure_batched(s_list_or_tensor)   # [B, L, P], [B, L]
 
         # 2) Single -> Pair
-        z = self.single_to_pair(s)                    # [B, L, L, pair_dim]
-        z = z.permute(0, 3, 1, 2).contiguous()        # [B, C=pair_dim, L, L]
-
-        # 2.5) Early downsample to reduce spatial side length
-        z = self.pre_pool(z)                          # [B, C, L', L']
+        z = self.single_to_pair(s)                          # [B, L, L, pair_dim]
+        z = z.permute(0, 3, 1, 2).contiguous()              # [B, C=pair_dim, L, L]
 
         # 3) U-Net encoder
         x = self.in_conv(z)
@@ -433,25 +356,18 @@ class PanimmuneEmbedderPairs(nn.Module):
             x, skip = down(x)     # skip channels == current 'ch'
             skips.append(skip)
 
-        # 4) Bottleneck (axial Transformer stack), exact mask resize to current side
+        # 4) Bottleneck (axial Transformer stack), exact mask resize to current L
         B, C, Ld, _ = x.shape
-        smask_scaled = self._resize_mask_1d(smask, Ld)  # [B, Ld]
+        smask_scaled = self._resize_mask_1d(smask, Ld)      # [B, Ld]
         x = self.bott_stack(x, smask_scaled)
 
         # 5) U-Net decoder (with skip connections)
         for up in self.ups:
-            skip = skips.pop()    # deepest first
+            skip = skips.pop()    # deepest first, channels == up.c_skip
             x = up(x, skip)
 
-        # 6) Project back to pair_dim channels at the (downsampled) side
-        x = self.out_conv(x)                          # [B, pair_dim, L', L']
-
-        # 7) Recover to original L0 x L0, if early pooled
-        if self.pre_pool_factor != 1:
-            x = F.interpolate(x, size=(L0, L0), mode='bilinear', align_corners=False)
-
-        # 8) Return [B, L, L, pair_dim]
-        x = x.permute(0, 2, 3, 1).contiguous()
+        # 6) Project back to pair_dim channels; return [B, L, L, pair_dim]
+        x = self.out_conv(x).permute(0, 2, 3, 1).contiguous()
         if return_intermediates:
             return x, s, smask
         return x
@@ -460,30 +376,12 @@ class PanimmuneEmbedderPairs(nn.Module):
 # ========================= Tiny smoke test ====================== #
 if __name__ == "__main__":
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Minimal inline configs for a quick check (real values should come from model_config)
-    class _ESM: pass
-    class _PAIR: pass
-    esm_cfg = _ESM(); pair_cfg = _PAIR()
-    esm_cfg.model_name = "facebook/esm2_t12_35M_UR50D"
-    esm_cfg.layer = None
-    esm_cfg.max_tokens = 1024
-    esm_cfg.stride = 256
-    esm_cfg.sep_token = ":"
-    esm_cfg.pad_side = "right"
-    esm_cfg.freeze = True
-    esm_cfg.run_esm_device = "same"
-
-    pair_cfg.proj_dim = 128
-    pair_cfg.pair_dim = 64
-    pair_cfg.mha_heads = 8
-    pair_cfg.dropout = 0.1
-    pair_cfg.unet_depth = 3
-    pair_cfg.unet_base_channels = 64
-    pair_cfg.chunk_rows = 512
-    pair_cfg.n_transformers = 4
-    pair_cfg.pre_pool_factor = 2
-
-    model = PanimmuneEmbedderPairs(esm_cfg, pair_cfg, device=dev).train()
-    with torch.cuda.amp.autocast(enabled=(dev.type=="cuda")):
-        z = model(["ACDEFGHIKLMNPQRSTVWY" * 40 + ":" + "ACDE" + ":" + "ACDEFGHIKLMNPQRSTVWY" * 40])
+    pair_cfg = PairConfig()
+    model = PanimmuneEmbedderPairs(pair_cfg, device=dev)
+    model.eval()
+    batch = [
+        "ACDEFGHIKLMNPQRSTVWY:ACDEFGHIKLMNPQRSTVWY" + "ACDEFGHIKLMNPQRSTVWY"*200,
+    ]
+    with torch.no_grad():
+        z = model(batch)
     print("z shape:", tuple(z.shape))
