@@ -339,6 +339,17 @@ class PanimmuneEmbedderPairs(nn.Module):
         m = m.squeeze(1).squeeze(1)
         return (m > 0.5)
 
+    @classmethod
+    def from_config(cls, pair_cfg: PairConfig, device: Optional[torch.device] = None):
+        """
+        Construct PanimmuneEmbedderPairs directly from a PairConfig object.
+        Example:
+            from model_config import load_default_config
+            cfg = load_default_config()
+            model = PanimmuneEmbedderPairs.from_config(cfg.pair, device=torch.device("cuda"))
+        """
+        return cls(pair_cfg=pair_cfg, device=device)
+
     # ---------- forward ----------
     def forward(self, batch_seqs: List[str], return_intermediates: bool = False):
         # 1) One-hot embeddings (projected), ragged->padded

@@ -1,7 +1,7 @@
 # train_classifier.py — BCEWithLogitsLoss trainer (float labels in [0,1])
 # - Works with your three modules (ESM removed):
 #     * model_config.py            -> load_default_config() returning ModelConfig(pair, classifier)
-#     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, pair_cfg)
+#     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, pair_cfg, device=...)
 #     * Panimmune_dataload.py      -> datasets returning (concat_seq_str, label_float_in_[0,1])
 #
 # - Features:
@@ -409,8 +409,8 @@ def run_training(train_sets,
         if is_main:
             print(f"[Warn] cfg.classifier.num_classes={cfg.classifier.num_classes} -> expected 1 for BCE. "
                   f"The trainer will slice to the first channel at runtime.")
-    # ESM removed: only (classifier, pair) are passed
-    model = PanImmunologyClassifier.from_config(cfg.classifier, cfg.pair)
+    # ESM removed: only (classifier, pair) are passed; also pass device
+    model = PanImmunologyClassifier.from_config(cfg.classifier, cfg.pair, device=device)
     model = model.to(device)
 
     if is_ddp:
