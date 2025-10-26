@@ -336,6 +336,57 @@ def smoke_test(model, dl, name, device, do_print=True):
     if do_print:
         print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | preds≈[{preds.min():.3f},{preds.max():.3f}] | labels={tuple(labels.shape)}")
 
+def save_embedder(model: nn.Module, epoch: int, save_dir: str):
+    """Save only the embedder (PanimmuneEmbedderPairs) weights."""
+    os.makedirs(save_dir, exist_ok=True)
+    msave = _get_msave(model)
+    path = os.path.join(save_dir, f"embedder_epoch{epoch}.pt")
+    torch.save({"state_dict": msave.embeder.state_dict()}, path)
+    print(f"[Save] Embedder checkpoint: {path}")
+
+
+def save_classifier(model: nn.Module, epoch: int, save_dir: str):
+    """Save everything EXCEPT the embedder (classifier head, pooling, etc.)."""
+    os.makedirs(save_dir, exist_ok=True)
+    msave = _get_msave(model)
+    path = os.path.join(save_dir, f"classification_epoch{epoch}.pt")
+    head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embeder.")}
+    torch.save({"state_dict": head_state}, path)
+    print(f"[Save] Classifier checkpoint: {path}")
+
+
+def save_checkpoint_split(model, opt, scaler, epoch, cfg: ModelConfig, train_sets, save_dir, device):
+    """
+    Save both parts (embedder + classifier) separately each SAVE_EVERY epoch.
+    Config and RNG states are still included in metadata.json for reproducibility.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1) Save embedder & classifier separately
+    save_embedder(model, epoch, save_dir)
+    save_classifier(model, epoch, save_dir)
+
+    # 2) Save lightweight metadata for reference (epoch, config, RNG)
+    meta = {
+        "epoch": int(epoch),
+        "cfg_esm": cfg.esm.__dict__,
+        "cfg_pair": cfg.pair.__dict__,
+        "cfg_classifier": cfg.classifier.__dict__,
+        "train_sets": train_sets,
+        "rng_state": torch.get_rng_state().tolist(),
+        "backend_device": device.type,
+    }
+    if torch.cuda.is_available():
+        meta["cuda_rng_state"] = torch.cuda.get_rng_state().tolist()
+
+    meta_path = os.path.join(save_dir, f"metadata_epoch{epoch}.json")
+    with open(meta_path, "w") as f:
+        import json
+        json.dump(meta, f, indent=2)
+
+    print(f"[Save] Metadata checkpoint: {meta_path}")
+
+
 # ============================= Main loop ============================= #
 def run_training(train_sets,
                  epochs=EPOCHS, batch_size=BATCH_SIZE,
@@ -449,7 +500,7 @@ def run_training(train_sets,
             print(f"[avg] loss={avg_loss:.4f}  MAE={avg_mae:.4f}  RMSE={avg_rmse:.4f}  time={time.time()-t0:.1f}s")
 
         if (epoch % save_every == 0) and is_main:
-            save_checkpoint(model, opt, scaler, epoch, cfg, list(loaders.keys()), SAVE_DIR, device)
+            save_checkpoint_split(model, opt, scaler, epoch, cfg, list(loaders.keys()), SAVE_DIR, device)
 
         barrier_if_distributed(is_ddp)
         free_device_cache(device)

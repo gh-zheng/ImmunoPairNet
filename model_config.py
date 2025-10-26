@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ESMConfig:
-    model_name: str = "facebook/esm2_t33_650M_UR50D"
+    model_name: str = "facebook/esm2_t6_8M_UR50D"
     layer: Optional[int] = None     # None -> last hidden
     max_tokens: int = 1024          # per window (incl. special tokens)
     stride: int = 896               # window overlap (< max_tokens)
