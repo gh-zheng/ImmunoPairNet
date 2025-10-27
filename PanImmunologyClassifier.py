@@ -1,23 +1,20 @@
 # PanImmunologyClassifier.py
 """
-PanImmunologyClassifier (Z-only, ESM-free)
+PanImmunologyClassifier (Z-only)
 - Input: batch_seqs (list of pre-concatenated sequences like 'A:B')
 - Output: logits tensor [B, num_classes]
-- Architecture: PanimmuneEmbedderPairs (internal embeder) → z [B, L, L, C]
-               → ZOnlyPooling → Linear (hidden) → GELU+Dropout → Linear (logits)
+- Architecture: PanimmuneEmbedderPairs (internal embeder) → z [B, L, L, C] → ZOnlyPooling → Linear (hidden) → GELU+Dropout → Linear (logits)
 """
 from __future__ import annotations
-from typing import List, Optional, Tuple
-
+from typing import List, Tuple
 import torch
 import torch.nn as nn
-
-from model_config import ZClassifierConfig, PairConfig
+from model_config import ZClassifierConfig
 from PanimmuneEmbedderPairs import PanimmuneEmbedderPairs
 
 
 class ZOnlyPooling(nn.Module):
-    """Pool only the pair grid z: [B, L, L, C].
+    """Pool only the pair grid z: [B, L, L, C]. Optional masks.
 
     Output feature dimension:
         C if use_max=False; 2C if use_max=True (mean ⊕ max).
@@ -29,7 +26,6 @@ class ZOnlyPooling(nn.Module):
         self.out_dim = self.pair_dim * (2 if self.use_max else 1)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z is [B, L, L, C]
         z_mean = z.mean(dim=(1, 2))  # [B, C]
         if self.use_max:
             z_max = z.amax(dim=(1, 2))  # [B, C]
@@ -45,62 +41,60 @@ class PanImmunologyClassifier(nn.Module):
     """
     def __init__(
         self,
-        classifier_cfg: ZClassifierConfig,
-        pair_cfg: PairConfig,
-        device: Optional[torch.device] = None,
+        esm_cfg,
+        pair_cfg,
+        pair_dim: int = 256,
+        num_classes: int = 2,
+        hidden_dim: int = 512,
+        dropout: float = 0.1,
+        use_max_pool: bool = True,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         super().__init__()
-        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Initialize internal PanimmuneEmbedderPairs embeder
+        self.embeder = PanimmuneEmbedderPairs(esm_cfg, pair_cfg, device=torch.device(device))
 
-        # Internal embedder (ESM-free, one-hot front end)
-        self.embeder = PanimmuneEmbedderPairs.from_config(pair_cfg, device=self.device)
-
-        # Pooling + MLP head
-        self.pool = ZOnlyPooling(pair_dim=classifier_cfg.pair_dim, use_max=classifier_cfg.use_max_pool)
-        self.fc1 = nn.Linear(self.pool.out_dim, classifier_cfg.hidden_dim)
+        self.pool = ZOnlyPooling(pair_dim, use_max=use_max_pool)
+        self.fc1 = nn.Linear(self.pool.out_dim, hidden_dim)
         self.act = nn.GELU()
-        self.drop = nn.Dropout(classifier_cfg.dropout)
-        self.fc2 = nn.Linear(classifier_cfg.hidden_dim, classifier_cfg.num_classes)
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
 
-    # ---- Backward-compatible factory ----
     @classmethod
     def from_config(
         cls,
-        classifier_cfg: ZClassifierConfig,
-        *cfgs,
-        device: Optional[torch.device] = None,
+        cfg: ZClassifierConfig,
+        esm_cfg,
+        pair_cfg,
     ) -> "PanImmunologyClassifier":
-        """
-        Accepts either:
-          - (classifier_cfg, pair_cfg)                 # new, ESM-free
-          - (classifier_cfg, esm_cfg, pair_cfg)        # legacy; esm_cfg is ignored
-        """
-        if len(cfgs) == 1:
-            pair_cfg = cfgs[0]
-        elif len(cfgs) == 2:
-            # legacy call form: (esm_cfg, pair_cfg) -> ignore esm_cfg
-            _, pair_cfg = cfgs
-        else:
-            raise TypeError("from_config expects (classifier_cfg, pair_cfg) or (classifier_cfg, esm_cfg, pair_cfg)")
-        return cls(classifier_cfg=classifier_cfg, pair_cfg=pair_cfg, device=device)
+        return cls(
+            esm_cfg=esm_cfg,
+            pair_cfg=pair_cfg,
+            pair_dim=cfg.pair_dim,
+            num_classes=cfg.num_classes,
+            hidden_dim=cfg.hidden_dim,
+            dropout=cfg.dropout,
+            use_max_pool=cfg.use_max_pool,
+        )
 
     def forward(self, batch_seqs: List[str]) -> torch.Tensor:
-        # z: [B, L, L, C]
-        z = self.embeder(batch_seqs)
-        feats = self.pool(z)  # [B, F]
+        # Use PanimmuneEmbedderPairs directly to obtain z embeddings
+        z = self.embeder(batch_seqs)  # [B, L, L, C]
+        feats = self.pool(z)           # [B, F]
         logits = self.fc2(self.drop(self.act(self.fc1(feats))))
         return logits
 
 
 if __name__ == "__main__":
-    # ESM-free smoke test
-    from model_config import load_default_config
+    # Example smoke test (assuming PanimmuneEmbedderPairs is available)
+    from model_config import ESMConfig, PairConfig
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = load_default_config()
-    model = PanImmunologyClassifier.from_config(cfg.classifier, cfg.pair, device=dev).to(dev)
+    esm_cfg = ESMConfig(model_name="facebook/esm2_t6_8M_UR50D", freeze=True)
+    pair_cfg = PairConfig(proj_dim=128, pair_dim=128, unet_depth=2, unet_base_channels=128)
 
+    cfg = ZClassifierConfig(pair_dim=128, num_classes=3)
+    model = PanImmunologyClassifier.from_config(cfg, esm_cfg, pair_cfg)
+    
     seqs = ["ACDEFG:LMNPQR", "MKTFF:GGGGG:GGGGGGG", "VVVVV:DDDDDDDDD"]
-    with torch.no_grad():
-        logits = model(seqs)
-    print("logits shape:", tuple(logits.shape))  # [B, num_classes]
+    logits = model(seqs)
+    print("logits shape:", logits.shape)  # [B, num_classes]

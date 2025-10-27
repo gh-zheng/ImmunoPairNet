@@ -51,7 +51,9 @@ class IEDBRetrainMHCDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[str, Any]:
         r = self.df.iloc[idx]
-        concat = self.sep.join([r["MHC_sequence"], r["Antigen"]])
+        parts = [r["MHC_sequence"], r["Antigen"]]
+        random.shuffle(parts)
+        concat = self.sep.join(parts)
         label = r["Label"]  # keep label as-is (no thresholding/casting)
         return concat, label
 
@@ -73,7 +75,9 @@ class IntegratedTCRDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[str, Any]:
         r = self.df.iloc[idx]
-        concat = self.sep.join([r["TCR_alpha"], r["TCR_beta"], r["Antigen"], r["MHC_sequence"]])
+        parts = [r["TCR_alpha"], r["TCR_beta"], r["Antigen"], r["MHC_sequence"]]
+        random.shuffle(parts)
+        concat = self.sep.join(parts)
         label = r["Label"]  # keep label as-is
         return concat, label
 

@@ -1,10 +1,10 @@
-# PanimmuneEmbedderPairs.py  (ESM-free, one-hot front end)
+#PanimmuneEmbedderPairs.py
 """
-Panimmune Pairwise U-Net (Axial Transformer Stack) — ESM removed
-- Input: concatenated chains with ':' separators (e.g., "HSEQ:LSEQ:ANTIGEN")
-- One-hot (20 AA only, separators ':' removed) -> Linear projector to proj_dim
+Panimmune Pairwise U-Net (Axial Transformer Stack, ESM freeze toggle)
+- Concatenate chains -> ESM hidden states (no attention maps), long-seq via sliding windows
+- Auto-detect ESM hidden size; linear projector -> proj_dim
 - Single->Pair: outer-product style init to [B, L, L, pair_dim]
-- U-Net over the pair grid [L x L]: ResNet encoder (stride-2), Axial Transformer bottleneck, ResNet decoder
+- U-Net over the pair grid [L x L]: ResNet encoder (stride-2), Axial Transformer stack bottleneck, ResNet decoder
 - Exact 1D mask resize to match bottleneck grid side length
 - SDPA/Flash friendly (need_weights=False), optional row chunking
 """
@@ -16,65 +16,120 @@ from typing import List, Tuple, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# from model_config import PairConfig  # keep your existing PairConfig
+from model_config import ESMConfig, PairConfig
+
+# ---- ESM (HuggingFace) ----
 try:
-    from model_config import PairConfig
-except Exception:
-    @dataclass
-    class PairConfig:
-        proj_dim: int = 128
-        pair_dim: int = 128
-        unet_base_channels: int = 128
-        unet_depth: int = 3
-        n_transformers: int = 2
-        mha_heads: int = 8
-        dropout: float = 0.1
-        chunk_rows: int = 0
+    from transformers import EsmTokenizer, EsmModel
+except Exception:  # pragma: no cover
+    EsmTokenizer = None
+    EsmModel = None
 
 
-# ============================ One-hot front end ============================ #
-class OneHotAAProjector(nn.Module):
+# ============================ Config ============================ #
+
+# ===================== ESM (auto-projected) ====================== #
+class LinearProjectedESM(nn.Module):
     """
-    Convert AA sequence (20 standard AAs) into one-hot vectors [L, 20] and linearly
-    project to [L, proj_dim]. ':' separators are stripped. Non-20-AA letters raise.
+    Wrap ESM; automatically detect hidden size and apply a linear projector to proj_dim.
+    Provides sliding-window stitching for long sequences.
     """
-    AA20 = "ACDEFGHIKLMNPQRSTVWY"
-    _AA_TO_IDX = {aa: i for i, aa in enumerate(AA20)}
-
-    def __init__(self, proj_dim: int, device: Optional[torch.device] = None):
+    def __init__(self, cfg: ESMConfig, proj_dim: int, device: Optional[torch.device] = None):
         super().__init__()
-        self.proj = nn.Linear(20, proj_dim, bias=True)
+        assert EsmTokenizer is not None and EsmModel is not None, "Install transformers to use ESM."
+        self.cfg = cfg
+        self.tokenizer = EsmTokenizer.from_pretrained(cfg.model_name)
+        self.model = EsmModel.from_pretrained(cfg.model_name)
         self.device = device if device is not None else torch.device("cpu")
-        self.to(self.device)
 
-    @classmethod
-    def _clean_and_index(cls, seq: str) -> torch.Tensor:
-        # Remove ':' separators; uppercase; validate only 20 AA letters
-        seq = seq.replace(":", "").upper()
-        if not seq:
-            raise ValueError("Empty sequence after removing ':' separators.")
-        idxs = []
-        for ch in seq:
-            if ch not in cls._AA_TO_IDX:
-                raise ValueError(
-                    f"Invalid residue '{ch}'. Only 20 AA letters allowed: {cls.AA20}"
-                )
-            idxs.append(cls._AA_TO_IDX[ch])
-        return torch.tensor(idxs, dtype=torch.long)
+        try:
+            self.tokenizer.padding_side = cfg.pad_side
+        except Exception:
+            pass
+
+        in_dim = int(self.model.config.hidden_size)  # auto-detect (320/480/640/1280...)
+        self.projector = nn.Linear(in_dim, proj_dim, bias=True)
+
+        # freeze or not
+        if self.cfg.freeze:
+            for p in self.model.parameters():
+                p.requires_grad = False
+
+        self.to(self.device)
 
     def embed(self, sequence: str) -> torch.Tensor:
         """
-        Returns [L, proj_dim] for a single sequence (':' removed).
+        Return [L, proj_dim] for a single concatenated sequence.
+        If L > max, do sliding windows with overlap and stitch via weighted average.
+        Gradients flow if freeze=False.
         """
-        idx = self._clean_and_index(sequence).to(self.device)                     # [L]
-        onehot = F.one_hot(idx, num_classes=20).to(dtype=torch.float32)           # [L, 20]
-        return self.proj(onehot)                                                  # [L, proj_dim]
+        # mirror parent train/eval state (harmless if frozen)
+        self.model.train(self.training)
+
+        L_max = self.cfg.max_tokens - 2  # reserve BOS/EOS
+        if len(sequence) <= L_max:
+            inputs = self.tokenizer(sequence, return_tensors="pt", add_special_tokens=True)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            out = self.model(**inputs, output_hidden_states=True)
+            hidden = out.last_hidden_state if self.cfg.layer is None else out.hidden_states[self.cfg.layer]
+            emb = hidden[0, 1:-1, :]       # strip BOS/EOS -> [L, H]
+            return self.projector(emb)     # [L, proj_dim]
+
+        # ---- sliding windows ----
+        win, stride, L = L_max, self.cfg.stride, len(sequence)
+        assert 0 < stride <= win, "stride must be in (0, win]"
+
+        pieces: List[torch.Tensor] = []
+        weights: List[torch.Tensor] = []
+        starts: List[int] = []
+
+        start = 0
+        while start < L:
+            end = min(start + win, L)
+            subseq = sequence[start:end]
+
+            inputs = self.tokenizer(subseq, return_tensors="pt", add_special_tokens=True)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            out = self.model(**inputs, output_hidden_states=True)
+            hidden = out.last_hidden_state if self.cfg.layer is None else out.hidden_states[self.cfg.layer]
+            rep = hidden[0, 1:-1, :]              # [l_chunk, H]
+            rep = self.projector(rep)             # [l_chunk, proj_dim]
+            pieces.append(rep)
+            starts.append(start)
+
+            # cosine ramp weights (smooth overlap)
+            l_chunk = rep.size(0)
+            w = torch.ones(l_chunk, device=self.device, dtype=rep.dtype)
+            if start > 0:
+                ramp = torch.linspace(0, math.pi, steps=min(stride, l_chunk), device=self.device, dtype=rep.dtype)
+                w[: ramp.numel()] *= 0.5 * (1 - torch.cos(ramp))
+            if end < L:
+                ramp = torch.linspace(0, math.pi, steps=min(stride, l_chunk), device=self.device, dtype=rep.dtype)
+                w[- ramp.numel():] *= 0.5 * (1 - torch.cos(ramp))
+            weights.append(w)
+
+            if end == L:
+                break
+            start = end - stride  # <-- this is the *only* advance rule we use
+
+        H = pieces[0].size(1)
+        out = torch.zeros((L, H), device=self.device, dtype=pieces[0].dtype)
+        denom = torch.zeros((L,), device=self.device, dtype=pieces[0].dtype)
+
+        # stitch with recorded starts (no guessed offsets)
+        for rep, w, s in zip(pieces, weights, starts):
+            l = rep.size(0)
+            out[s:s+l] = out[s:s+l] + rep * w[:, None]
+            denom[s:s+l] = denom[s:s+l] + w
+
+        return out / denom.clamp_min(1e-6)[:, None]
+
 
     def forward(self, batch: List[str]) -> Union[List[torch.Tensor], torch.Tensor]:
-        reps: List[torch.Tensor] = [self.embed(seq) for seq in batch]             # [L_i, proj_dim]
+        reps: List[torch.Tensor] = [self.embed(seq) for seq in batch]   # each [L_i, proj_dim]
         Ls = [t.size(0) for t in reps]
         if len(set(Ls)) == 1:
-            return torch.stack(reps, dim=0)                                       # [B, L, proj_dim]
+            return torch.stack(reps, dim=0)  # [B, L, proj_dim]
         return reps  # ragged; caller will pad
 
 
@@ -199,6 +254,7 @@ class AxialSelfAttention2D(nn.Module):
         zr = z.reshape(B * L, L, H)
         key_padding = None
         if mask_1d is not None:
+            # mask_1d: [B, L] (True=valid) -> key_padding (True=pad)
             m = (~mask_1d.bool())
             key_padding = m.unsqueeze(1).expand(B, L, L).reshape(B * L, L)
         r_out = self._run_chunked(self.row_mha, zr, key_padding)
@@ -263,16 +319,14 @@ class AxialTransformerStack(nn.Module):
 class PanimmuneEmbedderPairs(nn.Module):
     """
     End-to-end:
-      batch_seqs (concat with ':') -> one-hot(20) -> projector -> Single->Pair -> U-Net
+      batch_seqs (concat) -> ESM -> projector -> Single->Pair -> U-Net
     Forward returns the updated pair tensor: [B, L, L, pair_dim]
     """
-    def __init__(self, pair_cfg: PairConfig, device: Optional[torch.device] = None):
+    def __init__(self, esm_cfg: ESMConfig, pair_cfg: PairConfig, device: Optional[torch.device] = None):
         super().__init__()
         self.device = device if device is not None else torch.device("cpu")
+        self.esm = LinearProjectedESM(esm_cfg, pair_cfg.proj_dim, device=self.device)
         self.pair_cfg = pair_cfg
-
-        # One-hot → projector
-        self.fe = OneHotAAProjector(proj_dim=pair_cfg.proj_dim, device=self.device)
 
         # Single -> Pair
         self.single_to_pair = PairInitOPM(pair_cfg.proj_dim, pair_cfg.pair_dim, use_bias=True)
@@ -339,26 +393,15 @@ class PanimmuneEmbedderPairs(nn.Module):
         m = m.squeeze(1).squeeze(1)
         return (m > 0.5)
 
-    @classmethod
-    def from_config(cls, pair_cfg: PairConfig, device: Optional[torch.device] = None):
-        """
-        Construct PanimmuneEmbedderPairs directly from a PairConfig object.
-        Example:
-            from model_config import load_default_config
-            cfg = load_default_config()
-            model = PanimmuneEmbedderPairs.from_config(cfg.pair, device=torch.device("cuda"))
-        """
-        return cls(pair_cfg=pair_cfg, device=device)
-
     # ---------- forward ----------
     def forward(self, batch_seqs: List[str], return_intermediates: bool = False):
-        # 1) One-hot embeddings (projected), ragged->padded
-        s_list_or_tensor = self.fe(batch_seqs)              # list([L_i, proj_dim]) or [B, L, proj_dim]
-        s, smask = self._ensure_batched(s_list_or_tensor)   # [B, L, P], [B, L]
+        # 1) ESM embeddings (projected), ragged->padded
+        s_list_or_tensor = self.esm(batch_seqs)       # list([L_i, proj_dim]) or [B, L, proj_dim]
+        s, smask = self._ensure_batched(s_list_or_tensor)  # [B, L, P], [B, L]
 
         # 2) Single -> Pair
-        z = self.single_to_pair(s)                          # [B, L, L, pair_dim]
-        z = z.permute(0, 3, 1, 2).contiguous()              # [B, C=pair_dim, L, L]
+        z = self.single_to_pair(s)                    # [B, L, L, pair_dim]
+        z = z.permute(0, 3, 1, 2).contiguous()        # [B, C=pair_dim, L, L]
 
         # 3) U-Net encoder
         x = self.in_conv(z)
@@ -369,7 +412,7 @@ class PanimmuneEmbedderPairs(nn.Module):
 
         # 4) Bottleneck (axial Transformer stack), exact mask resize to current L
         B, C, Ld, _ = x.shape
-        smask_scaled = self._resize_mask_1d(smask, Ld)      # [B, Ld]
+        smask_scaled = self._resize_mask_1d(smask, Ld)  # [B, Ld]
         x = self.bott_stack(x, smask_scaled)
 
         # 5) U-Net decoder (with skip connections)
@@ -387,12 +430,18 @@ class PanimmuneEmbedderPairs(nn.Module):
 # ========================= Tiny smoke test ====================== #
 if __name__ == "__main__":
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pair_cfg = PairConfig()
-    model = PanimmuneEmbedderPairs(pair_cfg, device=dev)
-    model.eval()
+
+    # Example: freeze ESM (default). Set freeze=False to finetune ESM.
+    esm_cfg = ESMConfig(
+    )
+    pair_cfg = PairConfig(
+    )
+
+    model = PanimmuneEmbedderPairs(esm_cfg, pair_cfg, device=dev)
+    model.train()  # if freeze=True, ESM params stay frozen but will mirror train() for projector
+
     batch = [
-        "ACDEFGHIKLMNPQRSTVWY:ACDEFGHIKLMNPQRSTVWY" + "ACDEFGHIKLMNPQRSTVWY"*200,
+        "QVQLVQSGAEVKKPGSSVKVSCKASGGTFSSYAISWVRQAPGQGLEWMGGIIPIFGTANYAQKFQGRVTITADKSTSTAYMELSSLRSEDTAVYYCAREGEGWFGKPLRAFEFWGQGTVITVSSASTKGPSVFPLAPSSKSTSGGTAALGCLVKDYFPEPVTVSWNSGALTSGVHTFPAVLQSSGLYSLSSVVTVPSSSLGTQTYICNVNHKPSNTKVDKKVEPKSC:EIVLTQSPGTLSLSPGERATLSCRASQSVSSSYLAWYQQKPGQAPRLLIYGASSRATGIPDRFSGSGSGTDFTLTISRLEPEDFAVYYCQQYGTSQSTFGQGTRLEIKRTVAAPSVFIFPPSDEQLKSGTASVVCLLNNFYPREAKVQWKVDNALQSGNSQESVTEQDSKDSTYSLSSTLTLSKADYEKHKVYACEVTHQGLSSPVTKSFNRGEC:MIHSVFLLMFLLTPTESYVDVGPDSVKSACIEVDIQQTFFDKTWPRPIDVSKADGIIYPQGRTYSNITITYQGLFPYQGDHGDMYVYSAGHATGTTPQKLFVANYSQDVKQFANGFVVRIGAAANSTGTVIISPSTSATIRKIYPAFMLGSSVGNFSDGKMGRFFNHTLVLLPDGCGTLLRAFYCILEPRSGNHCPAGNSYTSFATYHTPATDCSDGNYNRNASLNSFKEYFNLRNCTFMYTYNITEDEILEWFGITQTAQGVHLFSSRYVDLYGGNMFQFATLPVYDTIKYYSIIPHSIRSIQSDRKAWAAFYVYKLQPLTFLLDFSVDGYIRRAIDCGFNDLSQLHCSYESFDVESGVYSVSSFEAKPSGSVVEQAEGVECDFSPLLSGTPPQVYNFKRLVFTNCNYNLTKLLSLFSVNDFTCSQISPAAIASNCYSSLILDYFSYPLSMKSDLSVSSAGPISQFNYKQSFSNPTCLILATVPHNLTTITKPLKYSYINKCSRLLSDDRTEVPQLVNANQYSPCVSIVPSTVWEDGDYYRKQLSPLEGGGWLVASGSTVAMTEQLQMGFGITVQYGTDTNSVCPKLEFANDTKIASQLGNCVEYSLYGVSGRGVFQNCTAVGVRQQRFVYDAYQNLVGYYSDDGNYYCLRACVSVPVSVIYDKETKTHATLFGSVACEHISSTMSQYSRSTRSMLKRRDSTYGPLQTPVGCVLGLVNSSLFVEDCKLPLGQSLCALPDTPSTLTPRSVRSVPGEMRLASIAFNHPIQVDQLNSSYFKLSIPTNFSFGVTQEYIQTTIQKVTVDCKQYVCNGFQKCEQLLREYGQFCSKINQALHGANLRQDDSVRNLFASVKSSQSSPIIPGFGGDFNLTLLEPVSISTGSRSARSAIEDLLFDKVTIADPGYMQGYDDCMQQGPASARDLICAQYVAGYKVLPPLMDVNMEAAYTSSLLGSIAGVGWTAGLSSFAAIPFAQSIFYRLNGVGITQQVLSENQKLIANKFNQALGAMQTGFTTTNEAFQKVQDAVNNNAQALSKLASELSNTFGAISASIGDIIQRLDVLEQDAQIDRLINGRLTTLNAFVAQQLVRSESAALSAQLAKDKVNECVKAQSKRSGFCGQGTHIVSFVVNAPNGLYFMHVGYYPSNHIEVVSAYGLCDAANPTNCIAPVNGYFIKTNNTRIVDEWSYTGSSFYAPEPITSLNTKYVAPQVTYQNISTNLPPPLLGNSTGIDFQDELDEFFKNVSTSIPNFGSLTQINTTLLDLTYEMLSLQQVVKALNESYIDLKELGNYTYYNKWPWYIWLGFIAGLVALALCVFFILCCTGCGTNCMGKLKCNRCCDRYEEYDLEPHKVHVH",
     ]
-    with torch.no_grad():
-        z = model(batch)
+    z = model(batch)
     print("z shape:", tuple(z.shape))

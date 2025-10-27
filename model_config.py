@@ -1,53 +1,58 @@
 # model_config.py
-from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any, Dict, List
+from dataclasses import dataclass, field
+# ... keep the rest of your imports
 
-# ========================== Pair (U-Net + Transformer) ========================== #
+@dataclass
+class ESMConfig:
+    model_name: str = "facebook/esm2_t6_8M_UR50D"
+    layer: Optional[int] = None     # None -> last hidden
+    max_tokens: int = 1024          # per window (incl. special tokens)
+    stride: int = 896               # window overlap (< max_tokens)
+    sep_token: str = ":"            # you concatenate chains upstream
+    pad_side: str = "right"
+    freeze: bool = True             # freeze ESM parameters or not
+
+
 @dataclass
 class PairConfig:
-    # Single-embedding projection size (one-hot → proj_dim)
-    proj_dim: int = 128
-    # Pair grid channels (input to U-Net)
-    pair_dim: int = 128
-    # U-Net backbone
-    unet_base_channels: int = 64
-    unet_depth: int = 3
-    dropout: float = 0.1
-    # Axial attention bottleneck
-    n_transformers: int = 4
+    proj_dim: int = 128             # projector output dim for single embeddings
+    pair_dim: int = 128             # pair channel dim (U-Net channels start here)
     mha_heads: int = 8
-    # Memory knob for axial attention (rows/cols chunking)
-    chunk_rows: int = 512
-    # Early spatial downsampling factor (1 = off)
-    pre_pool_factor: int = 2
+    dropout: float = 0.1
+    # U-Net depth & base channels (first conv after pair init)
+    unet_depth: int = 4
+    unet_base_channels: int = 128
+    # Axial attention memory knobs
+    chunk_rows: int = 0             # >0 to chunk B*L rows/cols in attention
+    # Number of axial Transformer blocks in bottleneck
+    n_transformers: int = 16
 
-
-# ============================= Z-only Classifier ================================ #
 @dataclass
 class ZClassifierConfig:
     pair_dim: int = 128        # C = channels of pair embedding (last dim of z)
     hidden_dim: int = 512      # hidden size of the MLP head
     num_classes: int = 1       # number of output classes
     dropout: float = 0.1       # dropout in the MLP head
-    use_max_pool: bool = True  # concat(mean(z), max(z)) if True; else mean(z)
-
-
-# =========================== Unified Model Config ============================== #
+    use_max_pool: bool = True  # if True, concat(mean(z), max(z)); else mean(z) only
 @dataclass
 class ModelConfig:
     """Unified container for model-related configurations."""
+    esm: ESMConfig
     pair: PairConfig
     classifier: ZClassifierConfig
 
 
 def load_default_config() -> ModelConfig:
     """
-    Create a unified default configuration combining Pair and Classifier configs.
+    Create a unified default configuration combining ESM, Pair, and Classifier configs.
     Returns:
         ModelConfig object containing:
+          - esm (ESMConfig)
           - pair (PairConfig)
           - classifier (ZClassifierConfig)
     """
+    esm_cfg = ESMConfig()
     pair_cfg = PairConfig()
     cls_cfg = ZClassifierConfig()
-    return ModelConfig(pair=pair_cfg, classifier=cls_cfg)
+    return ModelConfig(esm=esm_cfg, pair=pair_cfg, classifier=cls_cfg)

@@ -1,7 +1,8 @@
 # train_classifier.py — BCEWithLogitsLoss trainer (float labels in [0,1])
-# - Works with your three modules (ESM removed):
-#     * model_config.py            -> load_default_config() returning ModelConfig(pair, classifier)
-#     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, pair_cfg, device=...)
+# - Works with your four modules:
+#     * model_config.py            -> load_default_config() returning ModelConfig(esm, pair, classifier)
+#     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, esm_cfg, pair_cfg)
+#     * PanimmuneEmbedderPairs.py  -> used internally by the classifier
 #     * Panimmune_dataload.py      -> datasets returning (concat_seq_str, label_float_in_[0,1])
 #
 # - Features:
@@ -168,7 +169,7 @@ def build_dataset(kind: str, path: str):
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
     if LOCAL_TEST_100:
-        ds = Subset(ds, list(range(min(10, len(ds)))))
+        ds = Subset(ds, list(range(min(1, len(ds)))))
     return ds
 
 def collate_panimmune(batch: List[Tuple[str, Any]]):
@@ -205,6 +206,7 @@ def save_checkpoint(model, opt, scaler, epoch, cfg: ModelConfig, train_sets, sav
         "model": msave.state_dict(),
         "optimizer": opt.state_dict(),
         "scaler": (None if isinstance(scaler, _NullScaler) else scaler.state_dict()),
+        "cfg_esm": cfg.esm.__dict__,
         "cfg_pair": cfg.pair.__dict__,
         "cfg_classifier": cfg.classifier.__dict__,
         "train_sets": train_sets,
@@ -342,6 +344,7 @@ def save_embedder(model: nn.Module, epoch: int, save_dir: str):
     torch.save({"state_dict": msave.embeder.state_dict()}, path)
     print(f"[Save] Embedder checkpoint: {path}")
 
+
 def save_classifier(model: nn.Module, epoch: int, save_dir: str):
     """Save everything EXCEPT the embedder (classifier head, pooling, etc.)."""
     os.makedirs(save_dir, exist_ok=True)
@@ -350,6 +353,7 @@ def save_classifier(model: nn.Module, epoch: int, save_dir: str):
     head_state = {k: v for k, v in msave.state_dict().items() if not k.startswith("embeder.")}
     torch.save({"state_dict": head_state}, path)
     print(f"[Save] Classifier checkpoint: {path}")
+
 
 def save_checkpoint_split(model, opt, scaler, epoch, cfg: ModelConfig, train_sets, save_dir, device):
     """
@@ -365,6 +369,7 @@ def save_checkpoint_split(model, opt, scaler, epoch, cfg: ModelConfig, train_set
     # 2) Save lightweight metadata for reference (epoch, config, RNG)
     meta = {
         "epoch": int(epoch),
+        "cfg_esm": cfg.esm.__dict__,
         "cfg_pair": cfg.pair.__dict__,
         "cfg_classifier": cfg.classifier.__dict__,
         "train_sets": train_sets,
@@ -376,9 +381,11 @@ def save_checkpoint_split(model, opt, scaler, epoch, cfg: ModelConfig, train_set
 
     meta_path = os.path.join(save_dir, f"metadata_epoch{epoch}.json")
     with open(meta_path, "w") as f:
+        import json
         json.dump(meta, f, indent=2)
 
     print(f"[Save] Metadata checkpoint: {meta_path}")
+
 
 # ============================= Main loop ============================= #
 def run_training(train_sets,
@@ -409,8 +416,7 @@ def run_training(train_sets,
         if is_main:
             print(f"[Warn] cfg.classifier.num_classes={cfg.classifier.num_classes} -> expected 1 for BCE. "
                   f"The trainer will slice to the first channel at runtime.")
-    # ESM removed: only (classifier, pair) are passed; also pass device
-    model = PanImmunologyClassifier.from_config(cfg.classifier, cfg.pair, device=device)
+    model = PanImmunologyClassifier.from_config(cfg.classifier, cfg.esm, cfg.pair)
     model = model.to(device)
 
     if is_ddp:
@@ -514,6 +520,7 @@ def run_training(train_sets,
 
         with open(CONFIG_OUT, "w") as f:
             json.dump({
+                "esm": cfg.esm.__dict__,
                 "pair": cfg.pair.__dict__,
                 "classifier": cfg.classifier.__dict__,
                 "train": {
@@ -532,7 +539,7 @@ def run_training(train_sets,
 if __name__ == "__main__":
     MHC_ONLY = True
     TRAIN_SETS = ["mhc", "tcr", "ab"]
-    selected_sets = ["ab"] if MHC_ONLY else TRAIN_SETS
+    selected_sets = ["mhc"] if MHC_ONLY else TRAIN_SETS
 
     # Resume options
     RESUME = ""          # e.g., "model_parameter/ckpt_epoch10.pt"
