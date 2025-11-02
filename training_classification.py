@@ -38,7 +38,7 @@ DATA_PATHS = {
     "ab":  "data/integrated_antibody_data.csv",
 }
 
-EPOCHS = 10
+EPOCHS = 22
 BATCH_SIZE = 1
 BASE_LR = 3e-4
 WEIGHT_DECAY = 0.01
@@ -543,7 +543,7 @@ if __name__ == "__main__":
 
     # Resume options
     RESUME = ""          # e.g., "model_parameter/ckpt_epoch10.pt"
-    RESUME_SPLIT = None  # e.g., ("embedder_epoch10.pt", "classification_epoch10.pt", 11)
+    RESUME_SPLIT = (r'model_parameter\embedder_epoch_20.pt', r'model_parameter\classification_epoch_20.pt', 21)  # e.g., ("embedder_epoch10.pt", "classification_epoch10.pt", 11)
 
     run_training(
         train_sets=selected_sets,

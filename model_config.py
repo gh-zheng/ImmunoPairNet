@@ -5,19 +5,19 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ESMConfig:
-    model_name: str = "facebook/esm2_t6_8M_UR50D"
+    model_name: str = "facebook/esm2_t30_150M_UR50D"
     layer: Optional[int] = None     # None -> last hidden
     max_tokens: int = 1024          # per window (incl. special tokens)
     stride: int = 896               # window overlap (< max_tokens)
     sep_token: str = ":"            # you concatenate chains upstream
     pad_side: str = "right"
-    freeze: bool = True             # freeze ESM parameters or not
+    freeze: bool = False             # freeze ESM parameters or not
 
 
 @dataclass
 class PairConfig:
-    proj_dim: int = 128             # projector output dim for single embeddings
-    pair_dim: int = 128             # pair channel dim (U-Net channels start here)
+    proj_dim: int = 256             # projector output dim for single embeddings
+    pair_dim: int = 256             # pair channel dim (U-Net channels start here)
     mha_heads: int = 8
     dropout: float = 0.1
     # U-Net depth & base channels (first conv after pair init)
@@ -30,7 +30,7 @@ class PairConfig:
 
 @dataclass
 class ZClassifierConfig:
-    pair_dim: int = 128        # C = channels of pair embedding (last dim of z)
+    pair_dim: int = 256        # C = channels of pair embedding (last dim of z)
     hidden_dim: int = 512      # hidden size of the MLP head
     num_classes: int = 1       # number of output classes
     dropout: float = 0.1       # dropout in the MLP head
