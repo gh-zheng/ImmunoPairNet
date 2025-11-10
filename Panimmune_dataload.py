@@ -140,6 +140,7 @@ if __name__ == "__main__":
         seqs, labels = next(iter(dl))
         print("[MHC] seqs:", seqs)
         print("[MHC] labels:", labels.tolist() if hasattr(labels, 'tolist') else labels)
+        raise
 
     if os.path.exists(paths["TCR"]):
         ds = IntegratedTCRDataset(paths["TCR"])

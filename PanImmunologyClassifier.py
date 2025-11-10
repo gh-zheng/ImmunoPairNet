@@ -2,11 +2,13 @@
 """
 PanImmunologyClassifier (Z-only)
 - Input: batch_seqs (list of pre-concatenated sequences like 'A:B')
-- Output: logits tensor [B, num_classes]
-- Architecture: PanimmuneEmbedderPairs (internal embeder) → z [B, L, L, C] → ZOnlyPooling → Linear (hidden) → GELU+Dropout → Linear (logits)
+- Output: sigmoid probabilities tensor [B, num_classes]
+- Architecture: PanimmuneEmbedderPairs (internal embeder)
+  → z [B, L, L, C] → ZOnlyPooling → Linear (hidden)
+  → GELU+Dropout → Linear (logits) → Sigmoid (probabilities)
 """
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List
 import torch
 import torch.nn as nn
 from model_config import ZClassifierConfig
@@ -37,7 +39,7 @@ class PanImmunologyClassifier(nn.Module):
     """Pan-Immunology classifier using PanimmuneEmbedderPairs directly for embedding generation.
 
     Input:  batch_seqs -> ["CHAINA:CHAINB", ...]
-    Output: logits tensor [B, num_classes]
+    Output: sigmoid probabilities tensor [B, num_classes]
     """
     def __init__(
         self,
@@ -59,6 +61,7 @@ class PanImmunologyClassifier(nn.Module):
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_dim, num_classes)
+        self.sigmoid = nn.Sigmoid()  # Apply sigmoid to logits before output
 
     @classmethod
     def from_config(
@@ -82,19 +85,18 @@ class PanImmunologyClassifier(nn.Module):
         z = self.embeder(batch_seqs)  # [B, L, L, C]
         feats = self.pool(z)           # [B, F]
         logits = self.fc2(self.drop(self.act(self.fc1(feats))))
-        return logits
+        probs = self.sigmoid(logits)   # Apply sigmoid to get probabilities
+        return probs
 
 
 if __name__ == "__main__":
     # Example smoke test (assuming PanimmuneEmbedderPairs is available)
     from model_config import ESMConfig, PairConfig
-
-    esm_cfg = ESMConfig(model_name="facebook/esm2_t6_8M_UR50D", freeze=True)
-    pair_cfg = PairConfig(proj_dim=128, pair_dim=128, unet_depth=2, unet_base_channels=128)
-
-    cfg = ZClassifierConfig(pair_dim=128, num_classes=3)
+    esm_cfg = ESMConfig()
+    pair_cfg = PairConfig()
+    cfg = ZClassifierConfig()
     model = PanImmunologyClassifier.from_config(cfg, esm_cfg, pair_cfg)
-    
     seqs = ["ACDEFG:LMNPQR", "MKTFF:GGGGG:GGGGGGG", "VVVVV:DDDDDDDDD"]
-    logits = model(seqs)
-    print("logits shape:", logits.shape)  # [B, num_classes]
+    probs = model(seqs)
+    print("probabilities shape:", probs.shape)  # [B, num_classes]
+    print("probabilities:", probs)

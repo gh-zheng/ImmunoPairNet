@@ -8,3 +8,4 @@ MHC_esm2_token_embeddings_650M_long.pkl.gz
 esm_shards/*
 esm_antibody_antigen/*
 model_comparison/*
+running_model.py
