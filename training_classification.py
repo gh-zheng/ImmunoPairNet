@@ -1,4 +1,4 @@
-# train_classifier.py — MSELoss trainer (float labels in [0,1])
+#training_classification.py — MSELoss trainer (float labels in [0,1])
 # - Works with your four modules:
 #     * model_config.py            -> load_default_config() returning ModelConfig(esm, pair, classifier)
 #     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, esm_cfg, pair_cfg)
@@ -40,7 +40,7 @@ DATA_PATHS = {
 }
 
 EPOCHS = 22
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 BASE_LR = 3e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
@@ -189,7 +189,7 @@ def build_dataset(kind: str, path: str):
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
     if LOCAL_TEST_100:
-        ds = Subset(ds, list(range(min(1, len(ds)))))
+        ds = Subset(ds, list(range(min(4, len(ds)))))
     return ds
 
 def collate_panimmune(batch: List[Tuple[str, Any]]):
