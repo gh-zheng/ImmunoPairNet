@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Any, List, Tuple
-import random
 
 # ============================ Cleaning utils ============================ #
 VALID_AA = set("ACDEFGHIKLMNPQRSTVWY")
@@ -75,7 +74,6 @@ class IntegratedTCRDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[str, Any]:
         r = self.df.iloc[idx]
         parts = [r["Antigen"], r["MHC_sequence"], r["TCR_alpha"], r["TCR_beta"]]
-        random.shuffle(parts)
         concat = self.sep.join(parts)
         label = r["Label"]  # keep label as-is
         return concat, label
@@ -117,7 +115,6 @@ class IntegratedAntibodyDataset(Dataset):
             if len(r["Light_chain"]) > 0:
                 parts.append(r["Light_chain"])
         parts.append(r["Antigen"])
-        random.shuffle(parts)
         concat = self.sep.join(parts)
         label = r["Label"]  # keep label as-is
         return concat, label
