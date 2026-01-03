@@ -2,11 +2,12 @@
 """
 PanImmunologyClassifier (Z-only)
 - Input: batch_seqs (list of pre-concatenated sequences like 'A:B')
-- Output: sigmoid probabilities tensor [B, num_classes]
+- Output: positive-valued tensor [B, num_classes] in (0, +inf)
 - Architecture: PanimmuneEmbedderPairs (internal embeder)
   → z [B, L, L, C] → ZOnlyPooling → Linear (hidden)
-  → GELU+Dropout → Linear (logits) → Sigmoid (probabilities)
+  → GELU + Dropout → Linear (logits) → Softplus (positive output)
 """
+
 from __future__ import annotations
 from typing import List
 import torch
@@ -16,7 +17,7 @@ from PanimmuneEmbedderPairs import PanimmuneEmbedderPairs
 
 
 class ZOnlyPooling(nn.Module):
-    """Pool only the pair grid z: [B, L, L, C]. Optional masks.
+    """Pool only the pair grid z: [B, L, L, C].
 
     Output feature dimension:
         C if use_max=False; 2C if use_max=True (mean ⊕ max).
@@ -36,10 +37,10 @@ class ZOnlyPooling(nn.Module):
 
 
 class PanImmunologyClassifier(nn.Module):
-    """Pan-Immunology classifier using PanimmuneEmbedderPairs directly for embedding generation.
+    """Pan-Immunology classifier using PanimmuneEmbedderPairs directly.
 
     Input:  batch_seqs -> ["CHAINA:CHAINB", ...]
-    Output: sigmoid probabilities tensor [B, num_classes]
+    Output: positive scores tensor [B, num_classes]
     """
     def __init__(
         self,
@@ -53,15 +54,19 @@ class PanImmunologyClassifier(nn.Module):
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         super().__init__()
-        # Initialize internal PanimmuneEmbedderPairs embeder
-        self.embeder = PanimmuneEmbedderPairs(esm_cfg, pair_cfg, device=torch.device(device))
+
+        self.embeder = PanimmuneEmbedderPairs(
+            esm_cfg, pair_cfg, device=torch.device(device)
+        )
 
         self.pool = ZOnlyPooling(pair_dim, use_max=use_max_pool)
         self.fc1 = nn.Linear(self.pool.out_dim, hidden_dim)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_dim, num_classes)
-        self.sigmoid = nn.Sigmoid()  # Apply sigmoid to logits before output
+
+        # Positive, unbounded output
+        self.softplus = nn.Softplus()
 
     @classmethod
     def from_config(
@@ -81,22 +86,24 @@ class PanImmunologyClassifier(nn.Module):
         )
 
     def forward(self, batch_seqs: List[str]) -> torch.Tensor:
-        # Use PanimmuneEmbedderPairs directly to obtain z embeddings
-        z = self.embeder(batch_seqs)  # [B, L, L, C]
-        feats = self.pool(z)           # [B, F]
-        logits = self.fc2(self.drop(self.act(self.fc1(feats))))
-        probs = self.sigmoid(logits)   # Apply sigmoid to get probabilities
-        return probs
+        z = self.embeder(batch_seqs)      # [B, L, L, C]
+        feats = self.pool(z)              # [B, F]
+        logits = self.fc2(
+            self.drop(self.act(self.fc1(feats)))
+        )                                 # [B, num_classes]
+        return self.softplus(logits)      # (0, +inf)
 
 
 if __name__ == "__main__":
-    # Example smoke test (assuming PanimmuneEmbedderPairs is available)
     from model_config import ESMConfig, PairConfig
+
     esm_cfg = ESMConfig()
     pair_cfg = PairConfig()
     cfg = ZClassifierConfig()
+
     model = PanImmunologyClassifier.from_config(cfg, esm_cfg, pair_cfg)
     seqs = ["ACDEFG:LMNPQR", "MKTFF:GGGGG:GGGGGGG", "VVVVV:DDDDDDDDD"]
-    probs = model(seqs)
-    print("probabilities shape:", probs.shape)  # [B, num_classes]
-    print("probabilities:", probs)
+
+    y = model(seqs)
+    print("output shape:", y.shape)
+    print("output values:", y)

@@ -1,15 +1,20 @@
-#training_classification.py — MSELoss trainer (float labels in [0,1])
+# training_classification.py — MSELoss trainer (float labels in [0,1])
 # - Works with your four modules:
 #     * model_config.py            -> load_default_config() returning ModelConfig(esm, pair, classifier)
 #     * PanImmunologyClassifier.py -> PanImmunologyClassifier.from_config(classifier_cfg, esm_cfg, pair_cfg)
 #     * PanimmuneEmbedderPairs.py  -> used internally by the classifier
 #     * Panimmune_dataload.py      -> datasets returning (concat_seq_str, label_float_in_[0,1])
 #
+# - NOTE (updated):
+#     * PanImmunologyClassifier now returns POSITIVE, UNBOUNDED values (Softplus),
+#       so we train with MSE(pred_pos, label_in_[0,1]) directly.
+#     * We DO NOT apply sigmoid anywhere in training/eval.
+#
 # - Features:
 #     * DDP (CUDA/XPU/CPU), AMP, grad clipping
 #     * Checkpoint save/resume (full or split embedder/head)
 #     * Cache freeing between epochs
-#     * Regression metrics: MAE and RMSE (with MSE loss on logits)
+#     * Regression metrics: MAE and RMSE (computed on pred vs label, same space)
 #     * Linear warmup LR scheduler; persists global_step in full checkpoints
 
 import os, time, json, random, gc, math
@@ -59,6 +64,11 @@ SAVE_EVERY = 1
 
 WARMUP_STEPS = 1000  # linear warmup steps for fresh-optimizer resumes
 
+# Optional: stabilize early training when outputs are unbounded positive
+# Set to None to disable, or e.g. 10.0 to cap predictions in loss/metrics.
+PRED_CLAMP_MAX: Optional[float] = None
+
+
 # ============================= Utils ============================= #
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -83,10 +93,14 @@ def free_device_cache(device: torch.device):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
     elif device.type == "xpu" and is_xpu_available():
-        try: torch.xpu.synchronize()
-        except Exception: pass
-        try: torch.xpu.empty_cache()
-        except Exception: pass
+        try:
+            torch.xpu.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.xpu.empty_cache()
+        except Exception:
+            pass
     gc.collect()
 
 class _NullScaler:
@@ -105,7 +119,8 @@ def amp_autocast(device: torch.device):
     return nullcontext()
 
 def amp_scaler(device: torch.device, enabled: bool):
-    if not enabled: return _NullScaler()
+    if not enabled:
+        return _NullScaler()
     if device.type == "cuda":
         return torch.cuda.amp.GradScaler(enabled=True)
     if device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "amp"):
@@ -128,6 +143,7 @@ class WarmupLRScheduler:
         for g in self.opt.param_groups:
             g["lr"] = lr
         self.global_step += 1
+
 
 # ============================= DDP helpers ============================= #
 def init_distributed():
@@ -176,6 +192,7 @@ def dist_mean_scalar(x: float, device: torch.device, is_ddp: bool) -> float:
     t /= dist.get_world_size()
     return float(t.item())
 
+
 # ============================= Data helpers ============================= #
 def build_dataset(kind: str, path: str):
     if not os.path.exists(path):
@@ -188,6 +205,7 @@ def build_dataset(kind: str, path: str):
         ds = IntegratedAntibodyDataset(path, require_light=True)
     else:
         raise ValueError(f"Unknown dataset kind: {kind}")
+
     if LOCAL_TEST_100:
         ds = Subset(ds, list(range(min(4, len(ds)))))
     return ds
@@ -213,6 +231,7 @@ def make_loader(kind: str, ds, batch_size: int, is_ddp: bool):
         persistent_workers=PERSISTENT_WORKERS, drop_last=True
     )
     return dl, sampler
+
 
 # ============================= Checkpoint helpers ============================= #
 def _get_msave(model: nn.Module) -> nn.Module:
@@ -300,11 +319,16 @@ def load_split_epoch(model, embedder_path: str, head_path: str, device, strict: 
     missing, unexpected = msave.load_state_dict(head_state, strict=False)
     print(f"[Resume-split] missing={missing} unexpected={unexpected}")
 
+
 # ============================= Train/Eval ============================= #
 def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device,
-                     grad_clip_norm: float, use_amp: bool, scheduler: WarmupLRScheduler):
+                     grad_clip_norm: float, use_amp: bool, scheduler: WarmupLRScheduler,
+                     pred_clamp_max: Optional[float] = None):
     """
     Returns: loss_avg, mae_avg, rmse_avg (averaged over the dataset on this rank)
+
+    Model output is POSITIVE and UNBOUNDED (Softplus), not logits.
+    Labels are float32 in [0,1].
     """
     total = 0
     loss_sum = 0.0
@@ -313,7 +337,7 @@ def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device,
 
     scaler = amp_scaler(device, enabled=use_amp)
 
-    for batch_seqs, labels, _ in dl:  # batch_seqs: List[str]; labels: float32 [B] in [0,1]
+    for batch_seqs, labels, _ in dl:
         labels = labels.to(device, non_blocking=True)
 
         # step LR (linear warmup then hold)
@@ -321,12 +345,19 @@ def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device,
 
         opt.zero_grad(set_to_none=True)
         with amp_autocast(device):
-            logits = model(batch_seqs)            # [B, num_classes or 1]
-            # Ensure single logit for MSE; if model outputs >1, take the first channel
-            if logits.dim() == 2 and logits.size(1) != 1:
-                logits = logits[:, :1]
-            logits = logits.squeeze(-1)           # [B]
-            loss = loss_fn(logits, labels)
+            pred = model(batch_seqs)  # [B, num_classes or 1], positive in (0, +inf)
+
+            # Ensure single channel regression target
+            if pred.dim() == 2 and pred.size(1) != 1:
+                pred = pred[:, :1]
+            pred = pred.squeeze(-1)   # [B]
+
+            # Optional stabilization
+            if pred_clamp_max is not None:
+                pred = torch.clamp(pred, 0.0, float(pred_clamp_max))
+
+            # Compare in the same space as labels
+            loss = loss_fn(pred, labels)
 
         if isinstance(scaler, _NullScaler):
             loss.backward()
@@ -342,14 +373,13 @@ def train_one_loader(model: nn.Module, dl: DataLoader, loss_fn, opt, device,
             scaler.update()
 
         with torch.no_grad():
-            preds = torch.sigmoid(logits)         # [B] in [0,1] for reporting
             bsz = labels.size(0)
             total += bsz
             loss_sum += float(loss.item()) * bsz
-            mae_sum  += torch.sum(torch.abs(preds - labels)).item()
-            mse_sum  += torch.sum((preds - labels) ** 2).item()
 
-    # per-rank averages
+            mae_sum += torch.sum(torch.abs(pred - labels)).item()
+            mse_sum += torch.sum((pred - labels) ** 2).item()
+
     loss_avg = loss_sum / max(total, 1)
     mae_avg  = mae_sum  / max(total, 1)
     rmse_avg = math.sqrt(mse_sum / max(total, 1)) if total > 0 else 0.0
@@ -364,12 +394,18 @@ def smoke_test(model, dl, name, device, do_print=True):
             print(f"[{name}] dataset empty — skipping.")
         return
     labels = labels.to(device, non_blocking=True)
-    logits = model(batch_seqs)
-    if logits.dim() == 2 and logits.size(1) != 1:
-        logits = logits[:, :1]
-    preds = torch.sigmoid(logits.squeeze(-1))
+    pred = model(batch_seqs)
+
+    if pred.dim() == 2 and pred.size(1) != 1:
+        pred = pred[:, :1]
+    pred = pred.squeeze(-1)
+
     if do_print:
-        print(f"[{name}] smoke OK | logits={tuple(logits.shape)} | preds≈[{preds.min():.3f},{preds.max():.3f}] | labels={tuple(labels.shape)}")
+        print(
+            f"[{name}] smoke OK | pred={tuple(pred.shape)} "
+            f"| pred≈[{pred.min():.3f},{pred.max():.3f}] "
+            f"| labels≈[{labels.min():.3f},{labels.max():.3f}]"
+        )
 
 def save_embedder(model: nn.Module, epoch: int, save_dir: str):
     """Save only the embedder (PanimmuneEmbedderPairs) weights."""
@@ -418,6 +454,7 @@ def save_checkpoint_split(model, opt, scaler, epoch, cfg: ModelConfig, train_set
 
     print(f"[Save] Metadata checkpoint: {meta_path}")
 
+
 # ============================= Main loop ============================= #
 def run_training(train_sets,
                  epochs=EPOCHS, batch_size=BATCH_SIZE,
@@ -442,7 +479,6 @@ def run_training(train_sets,
 
     # ==== Build model from unified config ====
     cfg: ModelConfig = load_default_config()
-    # NOTE: MSELoss expects same-shape tensors; trainer will slice to one channel if needed.
     if hasattr(cfg.classifier, "num_classes") and cfg.classifier.num_classes != 1 and is_main:
         print(f"[Warn] cfg.classifier.num_classes={cfg.classifier.num_classes} -> trainer will slice to the first channel.")
 
@@ -481,7 +517,8 @@ def run_training(train_sets,
             dl, sampler = make_loader(kind, ds, batch_size, is_ddp)
             loaders[kind], samplers[kind] = dl, sampler
         except FileNotFoundError as e:
-            if is_main: print(e)
+            if is_main:
+                print(e)
 
     if not loaders:
         raise RuntimeError("No datasets found!")
@@ -515,13 +552,16 @@ def run_training(train_sets,
         model.train()
         for k, dl in loaders.items():
             loss_local, mae_local, rmse_local = train_one_loader(
-                model, dl, loss_fn, opt, device, GRAD_CLIP_NORM, use_amp, scheduler
+                model, dl, loss_fn, opt, device, GRAD_CLIP_NORM, use_amp, scheduler,
+                pred_clamp_max=PRED_CLAMP_MAX
             )
+
             # reduce to global means (per-rank averages -> mean across ranks)
             loss_avg = dist_mean_scalar(loss_local, device, is_ddp)
             mae_avg  = dist_mean_scalar(mae_local,  device, is_ddp)
             rmse_avg = dist_mean_scalar(rmse_local, device, is_ddp)
             per_ds_metrics[k] = (loss_avg, mae_avg, rmse_avg)
+
             if is_main:
                 print(f"[{k}] loss={loss_avg:.4f}  MAE={mae_avg:.4f}  RMSE={rmse_avg:.4f}")
 
@@ -564,13 +604,15 @@ def run_training(train_sets,
                     "lr": BASE_LR, "weight_decay": WEIGHT_DECAY, "seed": SEED,
                     "grad_clip_norm": GRAD_CLIP_NORM, "local_test_100": LOCAL_TEST_100,
                     "train_sets": train_sets, "world_size": world_size, "backend": backend,
-                    "warmup_steps": WARMUP_STEPS
+                    "warmup_steps": WARMUP_STEPS,
+                    "pred_clamp_max": PRED_CLAMP_MAX,
                 }
             }, f, indent=2)
         print(f"[Save] Config: {CONFIG_OUT}")
 
     if is_ddp and dist.is_initialized():
         dist.destroy_process_group()
+
 
 # ============================= Entrypoint ============================= #
 if __name__ == "__main__":
