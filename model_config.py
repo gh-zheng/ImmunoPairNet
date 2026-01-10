@@ -1,58 +1,90 @@
 # model_config.py
-from typing import Optional, Any, Dict, List
-from dataclasses import dataclass, field
-# ... keep the rest of your imports
-
-@dataclass
-class ESMConfig:
-    model_name: str = "facebook/esm2_t12_35M_UR50D"
-    layer: Optional[int] = None     # None -> last hidden
-    max_tokens: int = 1024          # per window (incl. special tokens)
-    stride: int = 896               # window overlap (< max_tokens)
-    sep_token: str = ":"            # you concatenate chains upstream
-    pad_side: str = "right"
-    freeze: bool = False             # freeze ESM parameters or not
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Literal
 
 
+# ========================= Pair / Embedder Config ========================= #
 @dataclass
 class PairConfig:
-    proj_dim: int = 256             # projector output dim for single embeddings
-    pair_dim: int = 256             # pair channel dim (U-Net channels start here)
-    mha_heads: int = 8
-    dropout: float = 0.1
-    # U-Net depth & base channels (first conv after pair init)
-    unet_depth: int = 4
-    unet_base_channels: int = 128
-    # Axial attention memory knobs
-    chunk_rows: int = 0             # >0 to chunk B*L rows/cols in attention
-    # Number of axial Transformer blocks in bottleneck
-    n_transformers: int = 16
+    """
+    Configuration for PanimmuneEmbedderPairs (one-hot + U-Net + axial bottleneck).
 
+    This config ASSUMES fixed-length MHC-I inputs:
+      - sequence format: "MHC:PEPTIDE"
+      - peptide length is fixed and enforced upstream
+    """
+
+    # ---- single (one-hot -> proj) ----
+    proj_dim: int = 16
+    aa_vocab: str = "ACDEFGHIKLMNPQRSTVWYX"  # 20 canonical + X (unknown/pad)
+
+    # ---- chain embedding ----
+    # 0 = PAD, 1 = MHC, 2 = peptide (extra chains clamp to chain_vocab-1)
+    chain_vocab: int = 8
+
+    # ---- pair / U-Net / axial bottleneck ----
+    pair_dim: int = 32
+    mha_heads: int = 4
+    dropout: float = 0.1
+
+    unet_depth: int = 3
+    unet_base_channels: int = 16
+
+    chunk_rows: int = 0
+    n_transformers: int = 4
+
+    # ---- fixed-length MHC-I binding setup ----
+    mhc_len: int = 34          # MHC pseudo-sequence length
+    pep_len: int = 11          # fixed peptide length
+
+    @property
+    def fixed_len(self) -> int:
+        """Total fixed concatenated length L = mhc_len + pep_len."""
+        return int(self.mhc_len + self.pep_len)
+
+
+# ========================= Head / Task Config ========================= #
 @dataclass
 class ZClassifierConfig:
-    pair_dim: int = 256        # C = channels of pair embedding (last dim of z)
-    hidden_dim: int = 512      # hidden size of the MLP head
-    num_classes: int = 1       # number of output classes
-    dropout: float = 0.1       # dropout in the MLP head
-    use_max_pool: bool = True  # if True, concat(mean(z), max(z)); else mean(z) only
+    """
+    Configuration for the Z-grid conv + flatten head.
+
+    Default setup:
+      - regression
+      - output in [0,1] via sigmoid
+    """
+
+    hidden_dim: int = 512
+    num_classes: int = 1
+    dropout: float = 0.1
+
+    # Conv head
+    n_convs: int = 2
+
+    # Output behavior
+    task_type: Literal["regression"] = "regression"
+    output_activation: Literal["sigmoid", "none"] = "sigmoid"
+    label_range: tuple[float, float] = (0.0, 1.0)
+
+
+# ========================= Unified Model Config ========================= #
 @dataclass
 class ModelConfig:
-    """Unified container for model-related configurations."""
-    esm: ESMConfig
+    """
+    Unified configuration container.
+    """
     pair: PairConfig
     classifier: ZClassifierConfig
 
 
 def load_default_config() -> ModelConfig:
     """
-    Create a unified default configuration combining ESM, Pair, and Classifier configs.
-    Returns:
-        ModelConfig object containing:
-          - esm (ESMConfig)
-          - pair (PairConfig)
-          - classifier (ZClassifierConfig)
+    Default configuration for MHC-I peptide binding regression:
+      - fixed-length (34 + 11)
+      - conv2d + flatten head
+      - sigmoid output in [0,1]
     """
-    esm_cfg = ESMConfig()
     pair_cfg = PairConfig()
     cls_cfg = ZClassifierConfig()
-    return ModelConfig(esm=esm_cfg, pair=pair_cfg, classifier=cls_cfg)
+    return ModelConfig(pair=pair_cfg, classifier=cls_cfg)
