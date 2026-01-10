@@ -36,7 +36,7 @@ class PairConfig:
 
     # ---- fixed-length MHC-I binding setup ----
     mhc_len: int = 34          # MHC pseudo-sequence length
-    pep_len: int = 11          # fixed peptide length
+    pep_len: int = 15          # fixed peptide length
 
     @property
     def fixed_len(self) -> int:
