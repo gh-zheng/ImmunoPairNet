@@ -5,9 +5,9 @@ fixed length; 2D conv+flatten head)
 
 - Works with your updated modules:
     * model_config.py               -> load_default_config() returning ModelConfig(pair, classifier)
-    * PanImmunologyClassifier.py    -> PanImmunologyRegressor.from_config(pair_cfg, clf_cfg, grid_len)
-    * PanimmuneEmbedderPairs.py     -> one-hot + U-Net + axial bottleneck, returns z [B,L,L,C]
-    * Panimmune_dataload.py         -> IEDBRetrainMHCDataset + collate_concat_regression
+    * MHCpeptideEmbeddingClassifier.py    -> PanImmunologyRegressor.from_config(pair_cfg, clf_cfg, grid_len)
+    * MHCpeptideEmbedding.py     -> one-hot + U-Net + axial bottleneck, returns z [B,L,L,C]
+    * MHCpeptide_dataload.py         -> IEDBRetrainMHCDataset + collate_concat_regression
                                       (supports label_fn for raw label processing)
 - Key notes:
     * Model output activation is CONFIG-DRIVEN via cfg.classifier.output_activation

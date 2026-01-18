@@ -146,7 +146,6 @@ class OneHotEmbedder(nn.Module):
         self.unk = self.aa_to_idx["X"]
 
         self.projector = nn.Linear(self.vocab_size, proj_dim, bias=True)
-        self.to(self.device)
 
     def _encode_one(self, seq: str) -> torch.Tensor:
         if not isinstance(seq, str) or not seq:
@@ -360,7 +359,7 @@ class MHCpeptideEmbedderPairs(nn.Module):
     """
     def __init__(self, pair_cfg: PairConfig, device: Optional[torch.device] = None):
         super().__init__()
-        self.device = device if device is not None else torch.device("cpu")
+        self.device = device if device is not None else torch.device("cuda")
         self.pair_cfg = pair_cfg
 
         self.proj_dim = pair_cfg.proj_dim
@@ -415,8 +414,6 @@ class MHCpeptideEmbedderPairs(nn.Module):
             ch = ch // 2
         self.ups = nn.ModuleList(ups)
         self.out_conv = nn.Conv2d(C0, pair_cfg.pair_dim, 3, padding=1)
-
-        self.to(self.device)
 
     # ---------- positional encoding ----------
     def _build_sinusoidal_pos(self, L: int, device) -> torch.Tensor:

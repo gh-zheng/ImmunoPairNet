@@ -145,8 +145,6 @@ class MHCpeptideRegressor(nn.Module):
         self.clamp_to_label_range = bool(clamp_to_label_range)
         self.label_range: Optional[Tuple[float, float]] = getattr(self.cfg, "label_range", None)
 
-        self.to(self.device)
-
     @classmethod
     def from_config(
         cls,
