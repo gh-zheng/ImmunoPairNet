@@ -1,4 +1,4 @@
-# PanImmunologyClassifier.py
+# MHCpeptideEmbeddingClassifier.py
 """
 PanImmunologyRegressor (fixed-length, Z-grid conv + flatten; NO pooling)
 
@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 from model_config import PairConfig, ZClassifierConfig
-from PanimmuneEmbedderPairs import PanimmuneEmbedderPairs
+from MHCpeptideEmbedding import MHCpeptideEmbedderPairs
 
 
 class ZGridConvFlattenHead(nn.Module):
@@ -89,7 +89,7 @@ class ZGridConvFlattenHead(nn.Module):
         return yhat
 
 
-class PanImmunologyRegressor(nn.Module):
+class MHCpeptideRegressor(nn.Module):
     """
     Regression model:
       batch_seqs -> z-grid -> conv+flatten -> output activation (config-driven)
@@ -112,7 +112,7 @@ class PanImmunologyRegressor(nn.Module):
         self.cfg = clf_cfg if clf_cfg is not None else ZClassifierConfig()
 
         # Embedder (one-hot)
-        self.embeder = PanimmuneEmbedderPairs(pair_cfg, device=self.device)
+        self.embeder = MHCpeptideEmbedderPairs(pair_cfg, device=self.device)
 
         # Fixed L required
         if grid_len is None:
@@ -154,7 +154,7 @@ class PanImmunologyRegressor(nn.Module):
         clf_cfg: ZClassifierConfig,
         grid_len: int,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    ) -> "PanImmunologyRegressor":
+    ) -> "MHCpeptideRegressor":
         return cls(pair_cfg=pair_cfg, clf_cfg=clf_cfg, grid_len=grid_len, device=device)
 
     def forward(self, batch_seqs: List[str]) -> torch.Tensor:
@@ -175,7 +175,7 @@ if __name__ == "__main__":
 
     grid_len = getattr(pair_cfg, "fixed_len", 45)
 
-    model = PanImmunologyRegressor.from_config(
+    model = MHCpeptideRegressor.from_config(
         pair_cfg, cfg, grid_len=grid_len, device="cpu"
     )
 

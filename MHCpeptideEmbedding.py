@@ -1,4 +1,4 @@
-# PanimmuneEmbedderPairs.py
+# MHCpeptideEmbedding.py
 """
 Panimmune Pairwise U-Net with strict multi-chain parsing and additive fusion
 (One-hot AA encoder; NO ESM / NO Transformers)
@@ -350,7 +350,7 @@ class AxialTransformerStack(nn.Module):
 
 
 # ========================= Full Model =========================== #
-class PanimmuneEmbedderPairs(nn.Module):
+class MHCpeptideEmbedderPairs(nn.Module):
     """
     End-to-end:
       item -> split into chains -> concat seq + chain_ids(1..K)
@@ -528,7 +528,7 @@ if __name__ == "__main__":
     #              (optional) chain_vocab, aa_vocab
     pair_cfg = PairConfig()
 
-    model = PanimmuneEmbedderPairs(pair_cfg, device=dev)
+    model = MHCpeptideEmbedderPairs(pair_cfg, device=dev)
     model.train()
 
     batch = [
@@ -557,7 +557,7 @@ if __name__ == "__main__":
         return rows
 
     # usage:
-    model = PanimmuneEmbedderPairs(pair_cfg, device=dev)
+    model = MHCpeptideEmbedderPairs(pair_cfg, device=dev)
     print("Trainable params:", count_params(model, True))
     print("Total params:", count_params(model, False))
     # for r in count_params_by_module(model)[:20]:

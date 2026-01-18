@@ -30,9 +30,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 # ==== your modules ====
 from model_config import ModelConfig, load_default_config
-from PanImmunologyClassifier import PanImmunologyRegressor
-from Panimmune_dataload import (
-    IEDBRetrainMHCDataset,
+from MHCpeptideEmbeddingClassifier import MHCpeptideRegressor
+from MHCpeptide_dataload import (
+    MHCpeptideDataset,
     collate_concat_regression,
 )
 
@@ -43,7 +43,7 @@ DATA_PATHS = {
 
 EPOCHS = 22
 BATCH_SIZE = 16
-BASE_LR = 3e-4
+BASE_LR = 1e-2
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 NUM_WORKERS = 4
@@ -200,7 +200,7 @@ def build_dataset_mhc(path: str, cfg: ModelConfig, label_fn: Optional[LabelFn] =
     if not os.path.exists(path):
         raise FileNotFoundError(f"[mhc] Missing file: {path}")
 
-    ds = IEDBRetrainMHCDataset(
+    ds = MHCpeptideDataset(
         csv_path=path,
         pair_cfg=cfg.pair,
         label_fn=label_fn,
@@ -408,7 +408,7 @@ def run_training(
     grid_len = int(getattr(cfg.pair, "fixed_len", cfg.pair.mhc_len + cfg.pair.pep_len))
 
     # Model output behavior is config-driven (cfg.classifier.output_activation)
-    model = PanImmunologyRegressor.from_config(
+    model = MHCpeptideRegressor.from_config(
         pair_cfg=cfg.pair,
         clf_cfg=cfg.classifier,
         grid_len=grid_len,

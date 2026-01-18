@@ -1,4 +1,4 @@
-# Panimmune_dataload.py
+# MHCpeptide_dataload.py
 from __future__ import annotations
 
 import pandas as pd
@@ -61,7 +61,7 @@ def _default_label_fn(x: Any) -> float:
 
 # =============================== Dataset =============================== #
 
-class IEDBRetrainMHCDataset(Dataset):
+class MHCpeptideDataset(Dataset):
     """
     IEDB_retrain_extraction_MHC_final.csv
     Expected columns: Antigen (peptide), MHC_sequence, Label
@@ -285,7 +285,7 @@ if __name__ == "__main__":
     # Example usage (needs real CSV):
     pair_cfg = PairConfig(mhc_len=34, pep_len=11)
     label_fn = make_log10_ic50_label_fn(1e-12)
-    ds = IEDBRetrainMHCDataset(r"data\IEDB_retrain_extraction_MHC_final.csv", pair_cfg, label_fn=label_fn)
+    ds = MHCpeptideDataset(r"data\IEDB_retrain_extraction_MHC_final.csv", pair_cfg, label_fn=label_fn)
     from torch.utils.data import DataLoader
     dl = DataLoader(ds, batch_size=8, shuffle=True, collate_fn=collate_concat_regression)
     seqs, y = next(iter(dl))
