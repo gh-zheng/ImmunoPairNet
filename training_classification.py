@@ -31,7 +31,7 @@ from torch.utils.data.distributed import DistributedSampler
 # ==== your modules ====
 from model_config import ModelConfig, load_default_config
 from MHCpeptideEmbeddingClassifier import MHCpeptideRegressor
-from MHCpeptide_dataload import (
+from PanTCR_dataload import (
     MHCpeptideDataset,
     collate_concat_regression,
 )
@@ -41,9 +41,9 @@ DATA_PATHS = {
     "mhc": "data/IEDB_retrain_extraction_MHC_final.csv",
 }
 
-EPOCHS = 22
+EPOCHS = 80
 BATCH_SIZE = 16
-BASE_LR = 1e-2
+BASE_LR = 4e-3
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 NUM_WORKERS = 4
@@ -52,7 +52,7 @@ PERSISTENT_WORKERS = True
 SEED = 42
 
 DO_SMOKE_TEST = False
-LOCAL_TEST_100 = False  # True for quick debug
+LOCAL_TEST_100 = True  # True for quick debug
 
 SAVE_DIR = "model_parameter"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -202,7 +202,7 @@ def build_dataset_mhc(path: str, cfg: ModelConfig, label_fn: Optional[LabelFn] =
 
     ds = MHCpeptideDataset(
         csv_path=path,
-        pair_cfg=cfg.pair,
+        pair_cfg=cfg.pmhc,
         label_fn=label_fn,
         sep=":",
         antigen_col="Antigen",
@@ -211,7 +211,7 @@ def build_dataset_mhc(path: str, cfg: ModelConfig, label_fn: Optional[LabelFn] =
     )
 
     if LOCAL_TEST_100:
-        ds = Subset(ds, list(range(min(256, len(ds)))))
+        ds = Subset(ds, list(range(min(16, len(ds)))))
     return ds
 
 def make_loader(ds, batch_size: int, is_ddp: bool):
@@ -243,7 +243,7 @@ def save_checkpoint(model, opt, scaler, epoch, cfg: ModelConfig, save_dir, devic
         "model": msave.state_dict(),
         "optimizer": opt.state_dict(),
         "scaler": (None if isinstance(scaler, _NullScaler) else scaler.state_dict()),
-        "cfg_pair": cfg.pair.__dict__,
+        "cfg_pair": cfg.pmhc.__dict__,
         "cfg_classifier": cfg.classifier.__dict__,
         "rng_state": torch.get_rng_state(),
         "backend_device": device.type,
@@ -405,11 +405,11 @@ def run_training(
     cfg: ModelConfig = load_default_config()
 
     # Grid length must match fixed_len
-    grid_len = int(getattr(cfg.pair, "fixed_len", cfg.pair.mhc_len + cfg.pair.pep_len))
+    grid_len = int(getattr(cfg.pmhc, "fixed_len", cfg.pmhc.mhc_len + cfg.pmhc.pep_len))
 
     # Model output behavior is config-driven (cfg.classifier.output_activation)
     model = MHCpeptideRegressor.from_config(
-        pair_cfg=cfg.pair,
+        pair_cfg=cfg.pmhc,
         clf_cfg=cfg.classifier,
         grid_len=grid_len,
         device=str(device),
@@ -435,7 +435,7 @@ def run_training(
         act = getattr(cfg.classifier, "output_activation", "sigmoid")
         lrng = getattr(cfg.classifier, "label_range", None)
         print(f"[Data] mhc: {len(ds)} samples (per-rank batch={batch_size})")
-        print(f"[Fixed] mhc_len={cfg.pair.mhc_len} pep_len={cfg.pair.pep_len} => grid_len={grid_len}")
+        print(f"[Fixed] mhc_len={cfg.pmhc.mhc_len} pep_len={cfg.pmhc.pep_len} => grid_len={grid_len}")
         print(f"[Model] output_activation={act}  label_range={lrng}")
         if PRED_CLAMP is not None:
             print(f"[Warn] PRED_CLAMP={PRED_CLAMP} (usually keep None when using sigmoid)")
@@ -483,7 +483,7 @@ def run_training(
 
         with open(config_out, "w") as f:
             json.dump({
-                "pair": cfg.pair.__dict__,
+                "pair": cfg.pmhc.__dict__,
                 "classifier": cfg.classifier.__dict__,
                 "train": {
                     "epochs": epochs,

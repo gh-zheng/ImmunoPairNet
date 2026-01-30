@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model_config import PairConfig  # ESMConfig no longer needed
+from model_config import PMHCPairConfig  # ESMConfig no longer needed
 
 
 # ============================ Helpers ============================ #
@@ -357,7 +357,7 @@ class MHCpeptideEmbedderPairs(nn.Module):
       s = token + alpha_pos*pos + alpha_chain*chain_embed -> LayerNorm
       Single->Pair -> U-Net (axial bottleneck) -> [B, L, L, pair_dim]
     """
-    def __init__(self, pair_cfg: PairConfig, device: Optional[torch.device] = None):
+    def __init__(self, pair_cfg: PMHCPairConfig, device: Optional[torch.device] = None):
         super().__init__()
         self.device = device if device is not None else torch.device("cuda")
         self.pair_cfg = pair_cfg
@@ -523,7 +523,7 @@ if __name__ == "__main__":
     # Must define: proj_dim, pair_dim, unet_depth, unet_base_channels,
     #              n_transformers, mha_heads, chunk_rows, dropout,
     #              (optional) chain_vocab, aa_vocab
-    pair_cfg = PairConfig()
+    pair_cfg = PMHCPairConfig()
 
     model = MHCpeptideEmbedderPairs(pair_cfg, device=dev)
     model.train()

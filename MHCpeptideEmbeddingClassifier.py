@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from model_config import PairConfig, ZClassifierConfig
+from model_config import PMHCPairConfig, ZClassifierConfig
 from MHCpeptideEmbedding import MHCpeptideEmbedderPairs
 
 
@@ -99,7 +99,7 @@ class MHCpeptideRegressor(nn.Module):
     """
     def __init__(
         self,
-        pair_cfg: PairConfig,
+        pair_cfg: PMHCPairConfig,
         clf_cfg: Optional[ZClassifierConfig] = None,
         grid_len: Optional[int] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -148,7 +148,7 @@ class MHCpeptideRegressor(nn.Module):
     @classmethod
     def from_config(
         cls,
-        pair_cfg: PairConfig,
+        pair_cfg: PMHCPairConfig,
         clf_cfg: ZClassifierConfig,
         grid_len: int,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -168,7 +168,7 @@ class MHCpeptideRegressor(nn.Module):
 
 
 if __name__ == "__main__":
-    pair_cfg = PairConfig()
+    pair_cfg = PMHCPairConfig()
     cfg = ZClassifierConfig(num_classes=1)  # and cfg.output_activation="sigmoid" in config
 
     grid_len = getattr(pair_cfg, "fixed_len", 45)
