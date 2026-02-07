@@ -8,7 +8,7 @@ What you asked to add:
 - Optionally FREEZE that pMHC module during training
 
 This trainer assumes:
-- Your classifier forward returns PROBABILITIES in (0,1) (sigmoid world)
+- Your TCRClassifierConfig forward returns PROBABILITIES in (0,1) (sigmoid world)
 - So we use nn.BCELoss (NOT BCEWithLogitsLoss)
 """
 
@@ -71,7 +71,7 @@ PRED_CLAMP: Optional[Tuple[float, float]] = (1e-6, 1.0 - 1e-6)
 # ===== Pretrained pMHC settings =====
 # Point this to your pretrained pMHC state_dict / checkpoint.
 # Recommended: save the pMHC module only: torch.save(pmhc.state_dict(), "pmhc_pretrained.pt")
-PMHC_PRETRAIN_CKPT = "model_parameter\pmhc_embedder_only.pt"   # e.g. "pretrained/pmhc_pretrained.pt"
+PMHC_PRETRAIN_CKPT = "./model_parameter/pmhc_embedder_only.pt"   # e.g. "pretrained/pmhc_pretrained.pt"
 FREEZE_PMHC = True        # True => keep pMHC fixed during training
 
 
@@ -535,7 +535,7 @@ def save_checkpoint(model, opt, scaler, epoch, cfg: ModelConfig, save_dir, devic
         "cfg_pmhc": cfg.pmhc.__dict__,
         "cfg_tcr": cfg.tcr.__dict__,
         "cfg_full": cfg.full.__dict__ if getattr(cfg, "full", None) is not None else None,
-        "cfg_classifier": cfg.classifier.__dict__,
+        "cfg_classifier": cfg.tcr_classifier.__dict__,
         "rng_state": torch.get_rng_state(),
         "backend_device": device.type,
         "pmhc_pretrain_ckpt": PMHC_PRETRAIN_CKPT,
@@ -642,10 +642,9 @@ def train_one_loader(
         opt.zero_grad(set_to_none=True)
 
         with amp_autocast(device):
-            probs = model(peps, mhcs, tcras, tcrbs).view(-1)  # PROBS in (0,1)
-            probs = _maybe_clamp(probs)
-
-            loss = loss_fn(probs, y)
+            logits = model(peps, mhcs, tcras, tcrbs).view(-1)  # raw logits (any real value)
+            loss = loss_fn(logits, y)
+            probs = torch.sigmoid(logits)  # only for metrics
             acc, _, _, f1 = binary_metrics_from_probs(probs.detach(), y.detach())
 
         if isinstance(scaler, _NullScaler):
@@ -717,16 +716,16 @@ def run_training(
     cfg: ModelConfig = load_default_config()
 
     # FORCE sigmoid output for this trainer
-    cfg.classifier.output_activation = "sigmoid"
-    if is_main:
-        print(f"[Model] FORCED classifier.output_activation={cfg.classifier.output_activation} (trainer uses BCELoss)")
+    #cfg.tcr_classifier.output_activation = "sigmoid"
+    #if is_main:
+    #    print(f"[Model] FORCED TCRClassifierConfig.output_activation={cfg.tcr_classifier.output_activation} (trainer uses BCELoss)")
 
     # Build model (NOT DDP yet)
     model = TCRpMHCClassifier.from_config(
         pmhc_cfg=cfg.pmhc,
         tcr_cfg=cfg.tcr,
         full_cfg=cfg.full,
-        clf_cfg=cfg.classifier,
+        clf_cfg=cfg.tcr_classifier,
         device=str(device),
         clamp_to_label_range=True,
         apply_mask_in_embedder=True,
@@ -735,7 +734,7 @@ def run_training(
     # Load pretrained pMHC weights + optionally freeze (do this BEFORE DDP wrap)
     if is_main and PMHC_PRETRAIN_CKPT:
         print(f"[pMHC] Will load pretrained: {PMHC_PRETRAIN_CKPT} | freeze={FREEZE_PMHC}")
-    load_pretrained_pmhc_into_model(model, PMHC_PRETRAIN_CKPT, freeze=FREEZE_PMHC, device=device)
+    load_pretrained_pmhc_into_model_with_checks(model, PMHC_PRETRAIN_CKPT, freeze=FREEZE_PMHC, device=device)
 
     if is_ddp:
         ddp_kwargs = {"device_ids": [local_rank]} if device.type != "cpu" else {}
@@ -745,7 +744,7 @@ def run_training(
     opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr, weight_decay=weight_decay)
 
     # sigmoid probs => BCELoss
-    loss_fn = nn.BCELoss()
+    loss_fn = nn.BCEWithLogitsLoss()
 
     scaler = amp_scaler(device, enabled=use_amp)
 
@@ -810,7 +809,7 @@ def run_training(
                 "pmhc": cfg.pmhc.__dict__,
                 "tcr": cfg.tcr.__dict__,
                 "full": cfg.full.__dict__,
-                "classifier": cfg.classifier.__dict__,
+                "classifier": cfg.tcr_classifier.__dict__,
                 "train": {
                     "epochs": epochs,
                     "batch_size_per_rank": batch_size,

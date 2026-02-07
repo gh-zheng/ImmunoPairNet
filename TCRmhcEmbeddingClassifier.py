@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from model_config import PMHCPairConfig, TCRPairConfig, FullGridPairConfig, ZClassifierConfig
+from model_config import PMHCPairConfig, TCRPairConfig, FullGridPairConfig, TCRClassifierConfig
 from tcrMHCpeptideEmbedding import TCRpMHCFullPairEmbedderMaxTotal
 
 
@@ -99,7 +99,7 @@ class TCRpMHCClassifier(nn.Module):
         pmhc_cfg: PMHCPairConfig,
         tcr_cfg: TCRPairConfig,
         full_cfg: FullGridPairConfig,
-        clf_cfg: Optional[ZClassifierConfig] = None,
+        clf_cfg: Optional[TCRClassifierConfig] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         clamp_to_label_range: bool = True,
         apply_mask_in_embedder: bool = True,
@@ -110,7 +110,7 @@ class TCRpMHCClassifier(nn.Module):
         self.pmhc_cfg = pmhc_cfg
         self.tcr_cfg = tcr_cfg
         self.full_cfg = full_cfg
-        self.cfg = clf_cfg if clf_cfg is not None else ZClassifierConfig()
+        self.cfg = clf_cfg if clf_cfg is not None else TCRClassifierConfig()
         self.apply_mask_in_embedder = bool(apply_mask_in_embedder)
 
         # Embedder returns z [B, L, L, C] with L = full_cfg.max_len_total
@@ -139,7 +139,7 @@ class TCRpMHCClassifier(nn.Module):
         )
 
         # Activation mode
-        act = str(getattr(self.cfg, "output_activation", "sigmoid")).lower().strip()
+        act = str(getattr(self.cfg, "output_activation", "none")).lower().strip()
         if act not in ("sigmoid", "none"):
             raise ValueError("cfg.output_activation must be 'sigmoid' or 'none'.")
         self.output_activation = act  # store string instead of module
@@ -154,7 +154,7 @@ class TCRpMHCClassifier(nn.Module):
         pmhc_cfg: PMHCPairConfig,
         tcr_cfg: TCRPairConfig,
         full_cfg: FullGridPairConfig,
-        clf_cfg: ZClassifierConfig,
+        clf_cfg: TCRClassifierConfig,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         clamp_to_label_range: bool = True,
         apply_mask_in_embedder: bool = True,
@@ -185,16 +185,10 @@ class TCRpMHCClassifier(nn.Module):
         )  # [B, L, L, C]
 
         logits = self.head(z)  # [B, 1]
-
         if self.output_activation == "sigmoid":
             yhat = torch.sigmoid(logits)     # <- explicit sigmoid function
         else:
             yhat = logits                    # unbounded
-
-        if self.clamp_to_label_range and self.label_range is not None:
-            lo, hi = float(self.label_range[0]), float(self.label_range[1])
-            yhat = torch.clamp(yhat, lo, hi)
-
         return yhat
 
 
@@ -203,7 +197,7 @@ if __name__ == "__main__":
     pmhc_cfg = PMHCPairConfig()
     tcr_cfg = TCRPairConfig()
     full_cfg = FullGridPairConfig(max_len_total=360)  # you can override max_len_tcr too
-    clf_cfg = ZClassifierConfig(num_classes=1, output_activation="sigmoid")
+    clf_cfg = TCRClassifierConfig(num_classes=1, output_activation="sigmoid")
 
     model = TCRpMHCClassifier.from_config(
         pmhc_cfg=pmhc_cfg,

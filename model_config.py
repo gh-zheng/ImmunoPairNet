@@ -83,8 +83,8 @@ class TCRPairConfig:
     n_transformers: int = 4
 
     # ---- TCR truncation budgets ----
-    tcr_a_max_len: int = 70
-    tcr_b_max_len: int = 70
+    tcr_a_max_len: int = 26
+    tcr_b_max_len: int = 22
 
     @property
     def max_len(self) -> int:
@@ -110,7 +110,7 @@ class FullGridPairConfig:
     """
 
     # ---- output sizing ----
-    max_len_total: int = 360
+    max_len_total: int = 26+22+34+15
     max_len_tcr: Optional[int] = None  # if None -> use TCRPairConfig.max_len
 
     def resolved_max_len_tcr(self, tcr_cfg: TCRPairConfig) -> int:
@@ -143,7 +143,7 @@ class FullGridPairConfig:
 
 # ========================= Head / Task Config ========================= #
 @dataclass
-class ZClassifierConfig:
+class pMHCClassifierConfig:
     """
     Configuration for a Z-grid conv + flatten head.
 
@@ -161,6 +161,23 @@ class ZClassifierConfig:
     output_activation: Literal["sigmoid", "none"] = "sigmoid"
     label_range: tuple[float, float] = (0.0, 1.0)
 
+@dataclass
+class TCRClassifierConfig:
+    """
+    Configuration for a TCR-only head (mirrors ZClassifierConfig).
+
+    Use this when you want a classifier/regressor on top of TCR features
+    (e.g., s_tcr pooled, or z_tcr diagonal-block grid).
+    """
+    hidden_dim: int = 512
+    num_classes: int = 1
+    dropout: float = 0.1
+
+    n_convs: int = 2  # keep for symmetry; ignore if your head is MLP-only
+
+    task_type: Literal["regression", "classification"] = "regression"
+    output_activation: Literal["sigmoid", "none"] = "none"
+    label_range: tuple[float, float] = (0.0, 1.0)
 
 # ========================= Unified Model Config ========================= #
 @dataclass
@@ -171,7 +188,8 @@ class ModelConfig:
     pmhc: PMHCPairConfig
     tcr: TCRPairConfig
     full: FullGridPairConfig
-    classifier: ZClassifierConfig
+    pMHC_classifier: pMHCClassifierConfig
+    tcr_classifier: TCRClassifierConfig
 
 
 def load_default_config() -> ModelConfig:
@@ -181,5 +199,6 @@ def load_default_config() -> ModelConfig:
     pmhc_cfg = PMHCPairConfig()
     tcr_cfg = TCRPairConfig()
     full_cfg = FullGridPairConfig()
-    cls_cfg = ZClassifierConfig()
-    return ModelConfig(pmhc=pmhc_cfg, tcr=tcr_cfg, full=full_cfg, classifier=cls_cfg)
+    pmhc_cls_cfg = pMHCClassifierConfig()
+    tcr_cls_cfg = TCRClassifierConfig()
+    return ModelConfig(pmhc=pmhc_cfg, tcr=tcr_cfg, full=full_cfg, pMHC_classifier=pmhc_cls_cfg, tcr_classifier=tcr_cls_cfg)

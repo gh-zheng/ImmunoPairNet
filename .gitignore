@@ -9,3 +9,4 @@ esm_shards/*
 esm_antibody_antigen/*
 model_comparison/*
 running_model.py
+/model_parameter_tcr/*

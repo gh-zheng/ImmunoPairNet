@@ -244,7 +244,7 @@ def save_checkpoint(model, opt, scaler, epoch, cfg: ModelConfig, save_dir, devic
         "optimizer": opt.state_dict(),
         "scaler": (None if isinstance(scaler, _NullScaler) else scaler.state_dict()),
         "cfg_pair": cfg.pmhc.__dict__,
-        "cfg_classifier": cfg.classifier.__dict__,
+        "cfg_classifier": cfg.pMHC_classifier.__dict__,
         "rng_state": torch.get_rng_state(),
         "backend_device": device.type,
     }
@@ -407,10 +407,10 @@ def run_training(
     # Grid length must match fixed_len
     grid_len = int(getattr(cfg.pmhc, "fixed_len", cfg.pmhc.mhc_len + cfg.pmhc.pep_len))
 
-    # Model output behavior is config-driven (cfg.classifier.output_activation)
+    # Model output behavior is config-driven (cfg.pMHC_classifier.output_activation)
     model = MHCpeptideRegressor.from_config(
         pair_cfg=cfg.pmhc,
-        clf_cfg=cfg.classifier,
+        clf_cfg=cfg.pMHC_classifier,
         grid_len=grid_len,
         device=str(device),
     ).to(device)
@@ -432,8 +432,8 @@ def run_training(
     dl, sampler = make_loader(ds, batch_size, is_ddp)
 
     if is_main:
-        act = getattr(cfg.classifier, "output_activation", "sigmoid")
-        lrng = getattr(cfg.classifier, "label_range", None)
+        act = getattr(cfg.pMHC_classifier, "output_activation", "sigmoid")
+        lrng = getattr(cfg.pMHC_classifier, "label_range", None)
         print(f"[Data] mhc: {len(ds)} samples (per-rank batch={batch_size})")
         print(f"[Fixed] mhc_len={cfg.pmhc.mhc_len} pep_len={cfg.pmhc.pep_len} => grid_len={grid_len}")
         print(f"[Model] output_activation={act}  label_range={lrng}")
