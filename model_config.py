@@ -83,8 +83,8 @@ class TCRPairConfig:
     n_transformers: int = 4
 
     # ---- TCR truncation budgets ----
-    tcr_a_max_len: int = 26
-    tcr_b_max_len: int = 22
+    tcr_a_max_len: int = 22
+    tcr_b_max_len: int = 26
 
     @property
     def max_len(self) -> int:

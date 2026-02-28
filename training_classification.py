@@ -42,7 +42,7 @@ DATA_PATHS = {
 }
 
 EPOCHS = 80
-BATCH_SIZE = 16
+BATCH_SIZE = 256
 BASE_LR = 4e-3
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
@@ -265,7 +265,18 @@ def load_checkpoint_if_any(resume_from: str, model, opt, scaler, device) -> Tupl
     ckpt = torch.load(resume_from, map_location=map_loc)
 
     msave = _get_msave(model)
-    msave.load_state_dict(ckpt["model"], strict=True)
+
+    # --- Model restore (support both formats) ---
+    if "model" in ckpt:
+        msave.load_state_dict(ckpt["model"], strict=True)
+    elif "state_dict" in ckpt:
+        # inference-style file; can't resume optimizer/scaler, but can load weights
+        msave.load_state_dict(ckpt["state_dict"], strict=True)
+        print(f"[Resume] Loaded weights-only checkpoint (state_dict). Optimizer/scaler/RNG not available.")
+        last_epoch = int(ckpt.get("epoch", 0))
+        return last_epoch + 1, 0
+    else:
+        raise KeyError(f"[Resume] Checkpoint missing 'model' or 'state_dict': keys={list(ckpt.keys())[:20]}")
 
     loaded_opt = False
     if ckpt.get("optimizer") is not None:
@@ -275,24 +286,59 @@ def load_checkpoint_if_any(resume_from: str, model, opt, scaler, device) -> Tupl
         except Exception as e:
             print(f"[Resume] Optimizer state load failed ({e}); continuing with fresh optimizer.")
 
-    if ckpt.get("scaler") and not isinstance(scaler, _NullScaler):
+    if ckpt.get("scaler") is not None and not isinstance(scaler, _NullScaler):
         try:
             scaler.load_state_dict(ckpt["scaler"])
         except Exception as e:
             print(f"[Resume] AMP scaler state load failed ({e}); continuing with fresh scaler.")
 
-    if "rng_state" in ckpt:
-        torch.set_rng_state(ckpt["rng_state"])
-    if torch.cuda.is_available() and "cuda_rng_state" in ckpt:
-        torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+    # --- CPU RNG restore (robust) ---
+    rng_state = ckpt.get("rng_state", None)
+    if rng_state is not None:
+        try:
+            if not torch.is_tensor(rng_state):
+                rng_state = torch.tensor(rng_state, dtype=torch.uint8)
+            else:
+                rng_state = rng_state.to(dtype=torch.uint8)
+            torch.set_rng_state(rng_state.cpu())
+        except Exception as e:
+            print(f"[Resume] CPU RNG state restore failed ({e}); continuing without RNG restore.")
+
+    # --- CUDA RNG restore (prefer *_all) ---
+    if device.type == "cuda" and torch.cuda.is_available():
+        cuda_all = ckpt.get("cuda_rng_state_all", None)
+        if cuda_all is not None:
+            try:
+                fixed = []
+                for s in cuda_all:
+                    if not torch.is_tensor(s):
+                        s = torch.tensor(s, dtype=torch.uint8)
+                    else:
+                        s = s.to(dtype=torch.uint8)
+                    fixed.append(s.cpu())
+                torch.cuda.set_rng_state_all(fixed)
+            except Exception as e:
+                print(f"[Resume] CUDA RNG (all) restore failed ({e}); continuing without CUDA RNG restore.")
+        else:
+            cuda_rng = ckpt.get("cuda_rng_state", None)
+            if cuda_rng is not None:
+                try:
+                    if not torch.is_tensor(cuda_rng):
+                        cuda_rng = torch.tensor(cuda_rng, dtype=torch.uint8)
+                    else:
+                        cuda_rng = cuda_rng.to(dtype=torch.uint8)
+                    torch.cuda.set_rng_state(cuda_rng.cpu(), device=device.index)
+                except Exception as e:
+                    print(f"[Resume] CUDA RNG state restore failed ({e}); continuing without CUDA RNG restore.")
 
     last_epoch = int(ckpt.get("epoch", 0))
     global_step = int(ckpt.get("global_step", 0))
 
-    print(f"[Resume] Loaded checkpoint: {resume_from} (epoch {last_epoch})"
-          f"{' with optimizer/scaler' if loaded_opt else ' (fresh optimizer)'}")
-    return last_epoch + 1, global_step if loaded_opt else 0
-
+    print(
+        f"[Resume] Loaded checkpoint: {resume_from} (epoch {last_epoch})"
+        f"{' with optimizer/scaler' if loaded_opt else ' (fresh optimizer)'}"
+    )
+    return last_epoch + 1, (global_step if loaded_opt else 0)
 
 # ============================= Train/Eval ============================= #
 def _maybe_clamp(pred: torch.Tensor) -> torch.Tensor:
@@ -484,7 +530,7 @@ def run_training(
         with open(config_out, "w") as f:
             json.dump({
                 "pair": cfg.pmhc.__dict__,
-                "classifier": cfg.classifier.__dict__,
+                "classifier": cfg.pMHC_classifier.__dict__,
                 "train": {
                     "epochs": epochs,
                     "batch_size_per_rank": batch_size,
@@ -509,7 +555,7 @@ def run_training(
 
 # ============================= Entrypoint ============================= #
 if __name__ == "__main__":
-    RESUME = ""  # e.g., "model_parameter/ckpt_epoch10.pt"
+    RESUME = "model_parameter\model_final.pt"  # e.g., "model_parameter/ckpt_epoch10.pt"
 
     # Your labels are normalized to [0,1] => keep label_fn=None
     label_fn = None

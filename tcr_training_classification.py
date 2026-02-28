@@ -38,13 +38,13 @@ from PanTCR_dataload import (
 
 # Data
 DATA_PATHS = {
-    "tcr": "data/integrated_TCR_data.csv",
+    "tcr": r"data\PISTE_reftcr.csv",
 }
 
 # Train hyperparams
-EPOCHS = 10
+EPOCHS = 60
 BATCH_SIZE = 16
-BASE_LR = 2e-3
+BASE_LR = 4e-4
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 NUM_WORKERS = 4
@@ -57,7 +57,13 @@ DO_SMOKE_TEST = False
 LOCAL_TEST_100 = True  # quick debug subset (takes first up to 64 samples)
 
 # Saving
-SAVE_DIR = "model_parameter_tcr"
+# Extract filename without extension from the data path
+data_file = DATA_PATHS["tcr"]
+filename = os.path.basename(data_file)  # "integrated_TCR_data.csv"
+filename_no_ext = os.path.splitext(filename)[0]  # "integrated_TCR_data"
+
+# Create save directory name
+SAVE_DIR = f"model_parameter_{filename_no_ext}"
 os.makedirs(SAVE_DIR, exist_ok=True)
 CONFIG_OUT = os.path.join(SAVE_DIR, "config.json")
 SAVE_EVERY = 1
@@ -71,7 +77,7 @@ PRED_CLAMP: Optional[Tuple[float, float]] = (1e-6, 1.0 - 1e-6)
 # ===== Pretrained pMHC settings =====
 # Point this to your pretrained pMHC state_dict / checkpoint.
 # Recommended: save the pMHC module only: torch.save(pmhc.state_dict(), "pmhc_pretrained.pt")
-PMHC_PRETRAIN_CKPT = "./model_parameter/pmhc_embedder_only.pt"   # e.g. "pretrained/pmhc_pretrained.pt"
+PMHC_PRETRAIN_CKPT = "./model_parameter/pmhc_embedder_only_epoch160.pt"   # e.g. "pretrained/pmhc_pretrained.pt"
 FREEZE_PMHC = True        # True => keep pMHC fixed during training
 
 
@@ -157,6 +163,9 @@ def load_pretrained_pmhc_into_model_with_checks(
             return ckpt_obj["state_dict"]
         if isinstance(ckpt_obj, dict) and "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
             return ckpt_obj["model"]
+        # Handle pMHC-specific checkpoint format: {"embedder_state_dict": ..., "pair_cfg": ..., "grid_len": ...}
+        if isinstance(ckpt_obj, dict) and "embedder_state_dict" in ckpt_obj:
+            return ckpt_obj["embedder_state_dict"]
         if isinstance(ckpt_obj, dict):
             return ckpt_obj
         raise ValueError("Unrecognized checkpoint format; expected dict-like state_dict.")
@@ -424,18 +433,14 @@ def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 def _extract_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
-    """
-    Accepts common checkpoint formats:
-      - raw state_dict
-      - {"state_dict": ...}
-      - {"model": ...}
-    """
     if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
         return ckpt_obj["state_dict"]
     if isinstance(ckpt_obj, dict) and "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
         return ckpt_obj["model"]
+    # Handle pMHC-specific checkpoint format: {"embedder_state_dict": ..., "pair_cfg": ..., "grid_len": ...}
+    if isinstance(ckpt_obj, dict) and "embedder_state_dict" in ckpt_obj:
+        return ckpt_obj["embedder_state_dict"]
     if isinstance(ckpt_obj, dict):
-        # might already be a state_dict-like dict
         return ckpt_obj
     raise ValueError("Unrecognized checkpoint format; expected dict-like state_dict.")
 

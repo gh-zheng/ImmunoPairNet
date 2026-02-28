@@ -2,6 +2,13 @@
 cmai-data/*
 classify.py
 /data/*.csv
+/data/*.py
+/data/*.txt
+/data/*.dat
+/data/*/
+metric.py
+run_tcr_model.py
+tcr_fig.py
 /model_parameter/*
 esm2_token_embeddings_650M.pkl.gz
 MHC_esm2_token_embeddings_650M_long.pkl.gz
@@ -10,3 +17,4 @@ esm_antibody_antigen/*
 model_comparison/*
 running_model.py
 /model_parameter_tcr/*
+/.vscode/*

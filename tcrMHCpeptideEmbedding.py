@@ -369,16 +369,17 @@ class TCREmbedderPairs(nn.Module):
         chain_id_vecs: List[torch.Tensor] = []
 
         for a, b in zip(tcra_list, tcrb_list):
-            a = _canon_aa_seq(a)
-            a = self._truncate(a, self.tcr_a_max_len)
+            b = _canon_aa_seq(b)
+            b = self._truncate(b, self.tcr_b_max_len)
 
             b = _norm_empty_to_none(b)
-            if b is None:
-                concat = a
-                ids = [1] * len(a)  # alpha
+            if a is None or a == '':
+                concat = b
+                ids = [1] * len(b) 
             else:
-                b = _canon_aa_seq(b)
-                b = self._truncate(b, self.tcr_b_max_len)
+                print(a)
+                a = _canon_aa_seq(a)
+                a = self._truncate(a, self.tcr_a_max_len)
                 concat = a + b
                 ids = [1] * len(a) + [2] * len(b)  # alpha then beta
 

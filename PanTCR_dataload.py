@@ -237,7 +237,7 @@ class IntegratedTCRDataset(Dataset):
         df = _read_csv_clean(csv_path)
 
         # Require minimal columns (TCR_beta optional)
-        required = [self.antigen_col, self.mhc_col, self.tcra_col, self.label_col]
+        required = [self.antigen_col, self.mhc_col, self.tcrb_col, self.label_col]
         for c in required:
             if c not in df.columns:
                 raise ValueError(f"Missing required column '{c}' in {csv_path}. Columns: {list(df.columns)}")
@@ -259,7 +259,7 @@ class IntegratedTCRDataset(Dataset):
         mask = (
             (df[self.antigen_col].str.len() > 0) &
             (df[self.mhc_col].str.len() > 0) &
-            (df[self.tcra_col].str.len() > 0)
+            (df[self.tcrb_col].str.len() > 0)
         )
         df = df[mask].reset_index(drop=True)
 
