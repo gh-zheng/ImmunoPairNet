@@ -377,7 +377,6 @@ class TCREmbedderPairs(nn.Module):
                 concat = b
                 ids = [1] * len(b) 
             else:
-                print(a)
                 a = _canon_aa_seq(a)
                 a = self._truncate(a, self.tcr_a_max_len)
                 concat = a + b

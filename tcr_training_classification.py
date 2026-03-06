@@ -1,15 +1,11 @@
 # training_tcr_classification.py
 """
-TCR+pMHC BINARY CLASSIFICATION trainer (labels 0/1; sigmoid probs output)
+TCR+pMHC BINARY CLASSIFICATION trainer (labels 0/1; BCEWithLogitsLoss)
 
-What you asked to add:
-- Use a PRETRAINED pMHC embedder inside the full model:
-    model.embedder.pmhc  (MHCpeptideEmbedderPairs)
-- Optionally FREEZE that pMHC module during training
-
-This trainer assumes:
-- Your TCRClassifierConfig forward returns PROBABILITIES in (0,1) (sigmoid world)
-- So we use nn.BCELoss (NOT BCEWithLogitsLoss)
+Enhanced with:
+- Different learning rates for pMHC (pretrained), TCR, and Classifier
+- Pretrained pMHC embedder with optional freezing
+- Comprehensive verification checks
 """
 
 import os, time, json, random, gc
@@ -33,18 +29,37 @@ from PanTCR_dataload import (
     IntegratedTCRDataset,
     collate_tcr_pmhc,
 )
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='TCR-pMHC Training')
+    parser.add_argument(
+        '--data_path',
+        type=str,
+        default="/scratch/10119/ghzheng/ImmunoPairNet/data/PISTE_unipep.csv",
+        help='Path to TCR dataset CSV file'
+    )
+    return parser.parse_args()
+
+# Parse arguments
+args = parse_args()
 
 # ============================= Editable config at top ============================= #
-
 # Data
 DATA_PATHS = {
-    "tcr": r"data\PISTE_reftcr.csv",
+    "tcr": args.data_path,
 }
+
 
 # Train hyperparams
 EPOCHS = 60
 BATCH_SIZE = 16
-BASE_LR = 4e-4
+
+# Learning rates for different components
+PMHC_LR = 1e-5          # For pMHC embedder (pretrained, needs smaller updates)
+BASE_LR = 4e-4          # For TCR embedder (randomly initialized)
+CLASSIFIER_LR = 5e-4    # For classifier head (can learn faster)
+
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0
 NUM_WORKERS = 4
@@ -59,8 +74,8 @@ LOCAL_TEST_100 = True  # quick debug subset (takes first up to 64 samples)
 # Saving
 # Extract filename without extension from the data path
 data_file = DATA_PATHS["tcr"]
-filename = os.path.basename(data_file)  # "integrated_TCR_data.csv"
-filename_no_ext = os.path.splitext(filename)[0]  # "integrated_TCR_data"
+filename = os.path.basename(data_file)  # "vdjdb_data.csv"
+filename_no_ext = os.path.splitext(filename)[0]  # "vdjdb_data"
 
 # Create save directory name
 SAVE_DIR = f"model_parameter_{filename_no_ext}"
@@ -76,8 +91,7 @@ PRED_CLAMP: Optional[Tuple[float, float]] = (1e-6, 1.0 - 1e-6)
 
 # ===== Pretrained pMHC settings =====
 # Point this to your pretrained pMHC state_dict / checkpoint.
-# Recommended: save the pMHC module only: torch.save(pmhc.state_dict(), "pmhc_pretrained.pt")
-PMHC_PRETRAIN_CKPT = "./model_parameter/pmhc_embedder_only_epoch160.pt"   # e.g. "pretrained/pmhc_pretrained.pt"
+PMHC_PRETRAIN_CKPT = "./model_parameter/pmhc_embedder_only_epoch160.pt"
 FREEZE_PMHC = True        # True => keep pMHC fixed during training
 
 
@@ -361,20 +375,23 @@ def amp_scaler(device: torch.device, enabled: bool):
     return _NullScaler()
 
 class WarmupLRScheduler:
-    """Linear warmup to base_lr for `warmup_steps` steps, then hold base_lr."""
-    def __init__(self, optimizer, base_lr: float, warmup_steps: int = 0, start_step: int = 0):
+    """Linear warmup for ALL param groups, each to their own base_lr."""
+    def __init__(self, optimizer, warmup_steps: int = 0, start_step: int = 0):
         self.opt = optimizer
-        self.base_lr = float(base_lr)
         self.warmup_steps = int(max(0, warmup_steps))
         self.global_step = int(max(0, start_step))
+        
+        # Store each group's base LR
+        self.base_lrs = [g["lr"] for g in optimizer.param_groups]
 
     def step(self):
         if self.warmup_steps > 0 and self.global_step < self.warmup_steps:
-            lr = self.base_lr * float(self.global_step + 1) / float(self.warmup_steps)
+            scale = float(self.global_step + 1) / float(self.warmup_steps)
+            for g, base_lr in zip(self.opt.param_groups, self.base_lrs):
+                g["lr"] = base_lr * scale
         else:
-            lr = self.base_lr
-        for g in self.opt.param_groups:
-            g["lr"] = lr
+            for g, base_lr in zip(self.opt.param_groups, self.base_lrs):
+                g["lr"] = base_lr
         self.global_step += 1
 
 
@@ -427,57 +444,79 @@ def dist_mean_scalar(x: float, device: torch.device, is_ddp: bool) -> float:
     return float(t.item())
 
 
-# ============================= Pretrained pMHC loader ============================= #
+# ============================= Optimizer with param groups ============================= #
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
-def _extract_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
-    if isinstance(ckpt_obj, dict) and "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
-        return ckpt_obj["state_dict"]
-    if isinstance(ckpt_obj, dict) and "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
-        return ckpt_obj["model"]
-    # Handle pMHC-specific checkpoint format: {"embedder_state_dict": ..., "pair_cfg": ..., "grid_len": ...}
-    if isinstance(ckpt_obj, dict) and "embedder_state_dict" in ckpt_obj:
-        return ckpt_obj["embedder_state_dict"]
-    if isinstance(ckpt_obj, dict):
-        return ckpt_obj
-    raise ValueError("Unrecognized checkpoint format; expected dict-like state_dict.")
-
-def load_pretrained_pmhc_into_model(model: nn.Module, ckpt_path: str, freeze: bool = True, device: Optional[torch.device] = None):
+def build_optimizer_with_param_groups(model: nn.Module, freeze_pmhc: bool = True, verbose: bool = True):
     """
-    Loads weights into: model.embedder.pmhc
-    and optionally freezes that module.
-
-    Call this AFTER model is created, BEFORE wrapping in DDP.
+    Build optimizer with different learning rates for different components.
+    
+    - pMHC embedder: PMHC_LR (or excluded if frozen)
+    - TCR embedder: BASE_LR
+    - Classifier head: CLASSIFIER_LR
+    - Other parameters: BASE_LR
     """
-    if not ckpt_path:
-        print("[pMHC] No pretrained ckpt set; training from scratch.")
-        return
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"[pMHC] Pretrained checkpoint not found: {ckpt_path}")
-
     m = _unwrap_model(model)
-    pmhc_mod = m.embedder.pmhc
-
-    map_location = "cpu" if device is None else device
-    ckpt = torch.load(ckpt_path, map_location=map_location)
-    sd = _extract_state_dict(ckpt)
-
-    # Try direct load first
-    missing, unexpected = pmhc_mod.load_state_dict(sd, strict=False)
-
-    print(f"[pMHC] Loaded pretrained weights from: {ckpt_path}")
-    if missing:
-        print(f"[pMHC] Missing keys (showing up to 10): {missing[:10]}{' ...' if len(missing) > 10 else ''}")
-    if unexpected:
-        print(f"[pMHC] Unexpected keys (showing up to 10): {unexpected[:10]}{' ...' if len(unexpected) > 10 else ''}")
-
-    if freeze:
-        for p in pmhc_mod.parameters():
-            p.requires_grad = False
-        pmhc_mod.eval()
-        print("[pMHC] Frozen (requires_grad=False) and set to eval().")
+    
+    param_groups = []
+    
+    # 1. pMHC parameters (only if not frozen)
+    if not freeze_pmhc:
+        pmhc_params = [p for p in m.embedder.pmhc.parameters() if p.requires_grad]
+        if pmhc_params:
+            param_groups.append({
+                'params': pmhc_params,
+                'lr': PMHC_LR,
+                'name': 'pmhc_embedder'
+            })
+            if verbose:
+                print(f"[Optimizer] pMHC embedder: {len(pmhc_params)} param tensors, LR={PMHC_LR}")
+    
+    # 2. TCR parameters
+    tcr_params = [p for p in m.embedder.tcr.parameters() if p.requires_grad]
+    if tcr_params:
+        param_groups.append({
+            'params': tcr_params,
+            'lr': BASE_LR,
+            'name': 'tcr_embedder'
+        })
+        if verbose:
+            print(f"[Optimizer] TCR embedder: {len(tcr_params)} param tensors, LR={BASE_LR}")
+    
+    # 3. Classifier head parameters (it's called 'head' in TCRpMHCClassifier)
+    head_params = [p for p in m.head.parameters() if p.requires_grad]
+    if head_params:
+        param_groups.append({
+            'params': head_params,
+            'lr': CLASSIFIER_LR,
+            'name': 'classifier_head'
+        })
+        if verbose:
+            print(f"[Optimizer] Classifier head: {len(head_params)} param tensors, LR={CLASSIFIER_LR}")
+    
+    # 4. Any remaining parameters (e.g., from full_model or other components)
+    covered_params = set()
+    if not freeze_pmhc:
+        covered_params.update(id(p) for p in m.embedder.pmhc.parameters())
+    covered_params.update(id(p) for p in m.embedder.tcr.parameters())
+    covered_params.update(id(p) for p in m.head.parameters())
+    
+    other_params = [p for p in m.parameters() if id(p) not in covered_params and p.requires_grad]
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': BASE_LR,
+            'name': 'other'
+        })
+        if verbose:
+            print(f"[Optimizer] Other parameters: {len(other_params)} param tensors, LR={BASE_LR}")
+    
+    if not param_groups:
+        raise ValueError("No trainable parameters found! Check if model is properly initialized.")
+    
+    return torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
 
 
 # ============================= Data helpers ============================= #
@@ -545,6 +584,9 @@ def save_checkpoint(model, opt, scaler, epoch, cfg: ModelConfig, save_dir, devic
         "backend_device": device.type,
         "pmhc_pretrain_ckpt": PMHC_PRETRAIN_CKPT,
         "freeze_pmhc": bool(FREEZE_PMHC),
+        "pmhc_lr": PMHC_LR,
+        "base_lr": BASE_LR,
+        "classifier_lr": CLASSIFIER_LR,
     }
     if torch.cuda.is_available():
         ckpt["cuda_rng_state"] = torch.cuda.get_rng_state()
@@ -685,10 +727,11 @@ def smoke_test(model, dl, name, device, do_print=True):
             print(f"[{name}] dataset empty — skipping.")
         return
     y = y.to(device, non_blocking=True).view(-1).float()
-    probs = model(peps, mhcs, tcras, tcrbs).view(-1)
+    logits = model(peps, mhcs, tcras, tcrbs).view(-1)
+    probs = torch.sigmoid(logits)
     probs = torch.clamp(probs, 0.0, 1.0)
     if do_print:
-        print(f"[{name}] smoke OK | probs={tuple(probs.shape)} probs≈[{probs.min():.3f},{probs.max():.3f}] y≈[{y.min():.1f},{y.max():.1f}]")
+        print(f"[{name}] smoke OK | logits={tuple(logits.shape)} logits≈[{logits.min():.3f},{logits.max():.3f}] probs≈[{probs.min():.3f},{probs.max():.3f}] y≈[{y.min():.1f},{y.max():.1f}]")
 
 
 # ============================= Main loop ============================= #
@@ -696,7 +739,6 @@ def smoke_test(model, dl, name, device, do_print=True):
 def run_training(
     epochs=EPOCHS,
     batch_size=BATCH_SIZE,
-    lr=BASE_LR,
     weight_decay=WEIGHT_DECAY,
     save_every=SAVE_EVERY,
     save_dir=SAVE_DIR,
@@ -720,11 +762,6 @@ def run_training(
 
     cfg: ModelConfig = load_default_config()
 
-    # FORCE sigmoid output for this trainer
-    #cfg.tcr_classifier.output_activation = "sigmoid"
-    #if is_main:
-    #    print(f"[Model] FORCED TCRClassifierConfig.output_activation={cfg.tcr_classifier.output_activation} (trainer uses BCELoss)")
-
     # Build model (NOT DDP yet)
     model = TCRpMHCClassifier.from_config(
         pmhc_cfg=cfg.pmhc,
@@ -745,10 +782,16 @@ def run_training(
         ddp_kwargs = {"device_ids": [local_rank]} if device.type != "cpu" else {}
         model = DDP(model, find_unused_parameters=False, **ddp_kwargs)
 
-    # Optimizer (trainable params only is clean if freezing pMHC)
-    opt = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr, weight_decay=weight_decay)
+    # Optimizer with different learning rates for different components
+    if is_main:
+        print(f"\n[Optimizer] Building optimizer with differentiated learning rates:")
+        print(f"  pMHC LR: {PMHC_LR} (frozen={FREEZE_PMHC})")
+        print(f"  TCR LR: {BASE_LR}")
+        print(f"  Classifier LR: {CLASSIFIER_LR}")
+    
+    opt = build_optimizer_with_param_groups(model, freeze_pmhc=FREEZE_PMHC, verbose=is_main)
 
-    # sigmoid probs => BCELoss
+    # BCEWithLogitsLoss (expects raw logits, not probabilities)
     loss_fn = nn.BCEWithLogitsLoss()
 
     scaler = amp_scaler(device, enabled=use_amp)
@@ -756,13 +799,13 @@ def run_training(
     start_epoch, loaded_global_step = (
         load_checkpoint_if_any(resume_from, model, opt, scaler, device) if resume_from else (1, 0)
     )
-    scheduler = WarmupLRScheduler(opt, base_lr=lr, warmup_steps=WARMUP_STEPS, start_step=loaded_global_step)
+    scheduler = WarmupLRScheduler(opt, warmup_steps=WARMUP_STEPS, start_step=loaded_global_step)
 
     ds = build_dataset_tcr(DATA_PATHS["tcr"], cfg, label_fn=label_fn)
     dl, sampler = make_loader(ds, batch_size, is_ddp)
 
     if is_main:
-        print(f"[Data] tcr: {len(ds)} samples (per-rank batch={batch_size})")
+        print(f"\n[Data] tcr: {len(ds)} samples (per-rank batch={batch_size})")
         print(f"[Fixed pMHC] mhc_len={cfg.pmhc.mhc_len} pep_len={cfg.pmhc.pep_len} fixed_len={cfg.pmhc.fixed_len}")
         print(f"[TCR max] a_max={cfg.tcr.tcr_a_max_len} b_max={cfg.tcr.tcr_b_max_len} (b optional)")
         print(f"[Full grid] max_len_total={cfg.full.max_len_total} pair_dim={cfg.full.pair_dim}")
@@ -794,7 +837,9 @@ def run_training(
         f1_avg   = dist_mean_scalar(f1_local,   device, is_ddp)
 
         if is_main:
-            print(f"[tcr] loss={loss_avg:.4f}  ACC={acc_avg:.4f}  F1={f1_avg:.4f}  time={time.time()-t0:.1f}s")
+            current_lrs = {g.get('name', f'group_{i}'): g['lr'] for i, g in enumerate(opt.param_groups)}
+            lr_str = ", ".join([f"{name}={lr:.2e}" for name, lr in current_lrs.items()])
+            print(f"[tcr] loss={loss_avg:.4f}  ACC={acc_avg:.4f}  F1={f1_avg:.4f}  LRs=[{lr_str}]  time={time.time()-t0:.1f}s")
 
         if (epoch % save_every == 0) and is_main:
             save_checkpoint(model, opt, scaler, epoch, cfg, save_dir, device, global_step=scheduler.global_step)
@@ -818,7 +863,9 @@ def run_training(
                 "train": {
                     "epochs": epochs,
                     "batch_size_per_rank": batch_size,
-                    "lr": lr,
+                    "pmhc_lr": PMHC_LR,
+                    "base_lr": BASE_LR,
+                    "classifier_lr": CLASSIFIER_LR,
                     "weight_decay": weight_decay,
                     "seed": SEED,
                     "grad_clip_norm": GRAD_CLIP_NORM,
@@ -827,13 +874,14 @@ def run_training(
                     "backend": backend,
                     "warmup_steps": WARMUP_STEPS,
                     "pred_clamp": PRED_CLAMP,
-                    "expect_probs": True,
+                    "expect_logits": True,
+                    "loss_function": "BCEWithLogitsLoss",
                     "pmhc_pretrain_ckpt": PMHC_PRETRAIN_CKPT,
                     "freeze_pmhc": bool(FREEZE_PMHC),
                 }
             }, f, indent=2)
 
-        print(f"[Save] Final model + config in: {save_dir}")
+        print(f"\n[Save] Final model + config in: {save_dir}")
 
     if is_ddp and dist.is_initialized():
         dist.destroy_process_group()
@@ -842,15 +890,14 @@ def run_training(
 # ============================= Entrypoint ============================= #
 
 if __name__ == "__main__":
-    RESUME = ""  # e.g., "model_parameter_tcr/ckpt_epoch10.pt"
+    RESUME = ""  # e.g., "model_parameter_vdjdb_data/ckpt_epoch10.pt"
 
-    # MixTCRpred labels are already 0/1 => label_fn=None
+    # Labels are already 0/1 => label_fn=None
     label_fn = None
 
     run_training(
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
-        lr=BASE_LR,
         weight_decay=WEIGHT_DECAY,
         save_every=SAVE_EVERY,
         save_dir=SAVE_DIR,

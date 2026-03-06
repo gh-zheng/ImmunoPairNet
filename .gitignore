@@ -16,5 +16,13 @@ esm_shards/*
 esm_antibody_antigen/*
 model_comparison/*
 running_model.py
-/model_parameter_tcr/*
+/model_parameter_*/*
+/rf_plots/*
+/source_analysis/*
+/benchmark/*
+/benchmark*
+/inference_progress*
 /.vscode/*
+model_parameter.zip
+model_running_model.py
+random_forest.py
