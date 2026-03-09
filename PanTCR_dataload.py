@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Any, List, Tuple, Optional, Callable
 
-from model_config import PMHCPairConfig, TCRPairConfig  # separated configs
+from src.model_config import PMHCPairConfig, TCRPairConfig  # separated configs
 
 
 # ============================ Cleaning utils (RETAIN) ============================ #

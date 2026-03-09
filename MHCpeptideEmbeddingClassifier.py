@@ -20,8 +20,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from model_config import PMHCPairConfig, pMHCClassifierConfig
-from MHCpeptideEmbedding import MHCpeptideEmbedderPairs
+from src.model_config import PMHCPairConfig, pMHCClassifierConfig
+from src.MHCpeptideEmbedding import MHCpeptideEmbedderPairs
 
 
 class ZGridConvFlattenHead(nn.Module):

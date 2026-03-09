@@ -17,8 +17,8 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from model_config import PMHCPairConfig, TCRPairConfig, FullGridPairConfig, TCRClassifierConfig
-from tcrMHCpeptideEmbedding import TCRpMHCFullPairEmbedderMaxTotal
+from src.model_config import PMHCPairConfig, TCRPairConfig, FullGridPairConfig, TCRClassifierConfig
+from src.tcrMHCpeptideEmbedding import TCRpMHCFullPairEmbedderMaxTotal
 
 
 class ZGridConvFlattenHead(nn.Module):

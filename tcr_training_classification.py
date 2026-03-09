@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 # ==== your modules ====
-from model_config import ModelConfig, load_default_config
+from src.model_config import ModelConfig, load_default_config
 
 # IMPORTANT: your file defines class "TCRpMHCClassifier"
 from TCRmhcEmbeddingClassifier import TCRpMHCClassifier
@@ -50,6 +50,10 @@ DATA_PATHS = {
     "tcr": args.data_path,
 }
 
+# Data
+DATA_PATHS = {
+    "tcr": r"data\PMTnet.csv",
+}
 
 # Train hyperparams
 EPOCHS = 60
@@ -58,7 +62,7 @@ BATCH_SIZE = 16
 # Learning rates for different components
 PMHC_LR = 1e-5          # For pMHC embedder (pretrained, needs smaller updates)
 BASE_LR = 4e-4          # For TCR embedder (randomly initialized)
-CLASSIFIER_LR = 5e-4    # For classifier head (can learn faster)
+CLASSIFIER_LR = 4e-4    # For classifier head (can learn faster)
 
 WEIGHT_DECAY = 0.01
 GRAD_CLIP_NORM = 1.0

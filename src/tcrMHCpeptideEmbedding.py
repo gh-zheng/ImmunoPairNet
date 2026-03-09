@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model_config import PMHCPairConfig, TCRPairConfig, FullGridPairConfig
-from MHCpeptideEmbedding import MHCpeptideEmbedderPairs  # existing pMHC embedder (fixed-length internally)
+from .model_config import PMHCPairConfig, TCRPairConfig, FullGridPairConfig
+from .MHCpeptideEmbedding import MHCpeptideEmbedderPairs  # existing pMHC embedder (fixed-length internally)
 
 
 # ============================ Helpers ============================ #

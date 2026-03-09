@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 # ==== your modules ====
-from model_config import ModelConfig, load_default_config
+from src.model_config import ModelConfig, load_default_config
 from MHCpeptideEmbeddingClassifier import MHCpeptideRegressor
 from PanTCR_dataload import (
     MHCpeptideDataset,
