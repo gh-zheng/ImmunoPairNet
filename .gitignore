@@ -27,3 +27,7 @@ running_model.py
 model_parameter.zip
 model_running_model.py
 random_forest.py
+downsampling.py
+archive_name.tar.gz
+balanced_data.csv
+data/train_data.zip

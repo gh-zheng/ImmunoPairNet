@@ -39,6 +39,12 @@ def parse_args():
         default="/scratch/10119/ghzheng/ImmunoPairNet/data/PISTE_unipep.csv",
         help='Path to TCR dataset CSV file'
     )
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default='model_parameter_vdjdb\ckpt_epoch36.pt',
+        help='provide checkpoint dir'
+    )
     return parser.parse_args()
 
 # Parse arguments
@@ -56,7 +62,7 @@ DATA_PATHS = {
 }
 
 # Train hyperparams
-EPOCHS = 60
+EPOCHS = 120
 BATCH_SIZE = 16
 
 # Learning rates for different components
@@ -894,7 +900,7 @@ def run_training(
 # ============================= Entrypoint ============================= #
 
 if __name__ == "__main__":
-    RESUME = ""  # e.g., "model_parameter_vdjdb_data/ckpt_epoch10.pt"
+    RESUME = args.checkpoint  # e.g., "model_parameter_vdjdb_data/ckpt_epoch10.pt"
 
     # Labels are already 0/1 => label_fn=None
     label_fn = None
